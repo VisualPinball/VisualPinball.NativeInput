@@ -1,0 +1,189 @@
+name: Build and Publish
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: Calculate Version
+    runs-on: ubuntu-latest
+    outputs:
+      package_version: ${{ steps.version.outputs.package_version }}
+      is_release: ${{ steps.version.outputs.is_release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: version
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || echo "v0.0.0")
+          TAG_VERSION=${LAST_TAG#v}
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            PACKAGE_VERSION="${GITHUB_REF#refs/tags/v}"
+            IS_RELEASE=true
+          else
+            if [[ ${TAG_VERSION} =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              MAJOR=${BASH_REMATCH[1]}
+              MINOR=${BASH_REMATCH[2]}
+              PATCH=${BASH_REMATCH[3]}
+            else
+              MAJOR=0
+              MINOR=0
+              PATCH=0
+            fi
+
+            if git rev-parse "${LAST_TAG}" >/dev/null 2>&1; then
+              COMMITS_SINCE_TAG=$(git rev-list "${LAST_TAG}"..HEAD --count)
+            else
+              COMMITS_SINCE_TAG=$(git rev-list HEAD --count)
+            fi
+
+            NEXT_PATCH=$((PATCH + 1))
+            PACKAGE_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}-preview.${COMMITS_SINCE_TAG}"
+            IS_RELEASE=false
+          fi
+
+          echo "package_version=${PACKAGE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "is_release=${IS_RELEASE}" >> "$GITHUB_OUTPUT"
+          echo "Package Version: ${PACKAGE_VERSION}"
+          echo "Is Release: ${IS_RELEASE}"
+
+  build-native:
+    name: Build native library (${{ matrix.rid }})
+    runs-on: ${{ matrix.os }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, rid: win-x64, platform: windows, arch: x64 }
+          - { os: windows-latest, rid: win-x86, platform: windows, arch: x86 }
+          - { os: ubuntu-latest, rid: linux-x64, platform: linux, arch: x64 }
+          - { os: macos-15, rid: osx-x64, platform: macos, arch: x64 }
+          - { os: macos-15, rid: osx-arm64, platform: macos, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev
+
+      - name: Build native library
+        run: |
+          OUTPUT_DIR="$GITHUB_WORKSPACE/artifacts/${{ matrix.rid }}"
+          BUILD_DIR="build/${{ matrix.rid }}"
+          mkdir -p "$OUTPUT_DIR"
+
+          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+            if [[ "${{ matrix.arch }}" == "x86" ]]; then
+              cmake -S . -B "$BUILD_DIR" -G "Visual Studio 17 2022" -A Win32 -DVPE_NATIVEINPUT_OUTPUT_DIR="$OUTPUT_DIR"
+            else
+              cmake -S . -B "$BUILD_DIR" -G "Visual Studio 17 2022" -A x64 -DVPE_NATIVEINPUT_OUTPUT_DIR="$OUTPUT_DIR"
+            fi
+            cmake --build "$BUILD_DIR" --config Release
+          elif [[ "${{ matrix.platform }}" == "macos" ]]; then
+            if [[ "${{ matrix.arch }}" == "x64" ]]; then
+              OSX_ARCH=x86_64
+            else
+              OSX_ARCH=arm64
+            fi
+            cmake -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="$OSX_ARCH" -DVPE_NATIVEINPUT_OUTPUT_DIR="$OUTPUT_DIR"
+            cmake --build "$BUILD_DIR" --config Release
+          else
+            cmake -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DVPE_NATIVEINPUT_OUTPUT_DIR="$OUTPUT_DIR"
+            cmake --build "$BUILD_DIR" --config Release
+          fi
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nativeinput-${{ matrix.rid }}
+          path: artifacts/${{ matrix.rid }}
+
+  pack-nuget:
+    name: Pack NuGet package
+    runs-on: ubuntu-latest
+    needs: [version, build-native]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: nuget/setup-nuget@v2
+
+      - name: Install mono
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mono-complete
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nativeinput-win-x64
+          path: artifacts/win-x64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nativeinput-win-x86
+          path: artifacts/win-x86
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nativeinput-linux-x64
+          path: artifacts/linux-x64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nativeinput-osx-x64
+          path: artifacts/osx-x64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nativeinput-osx-arm64
+          path: artifacts/osx-arm64
+
+      - name: Pack NuGet package
+        run: |
+          PACK_NUSPEC="native/nuget/VisualPinball.NativeInput.pack.nuspec"
+          cp native/nuget/VisualPinball.NativeInput.nuspec "$PACK_NUSPEC"
+          sed -i "s/__VERSION__/${{ needs.version.outputs.package_version }}/g" "$PACK_NUSPEC"
+          mkdir -p native/nuget/nupkg
+          nuget pack "$PACK_NUSPEC" -OutputDirectory native/nuget/nupkg
+
+      - name: Upload NuGet package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: native/nuget/nupkg
+
+  publish:
+    name: Publish to NuGet
+    runs-on: ubuntu-latest
+    needs: [version, pack-nuget]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nupkg
+          path: nupkg
+
+      - name: Publish package
+        run: |
+          for file in nupkg/*.nupkg; do
+            dotnet nuget push "$file" --api-key "${{ secrets.NUGET_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+          done

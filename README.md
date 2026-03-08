@@ -4,7 +4,7 @@ High-performance native input polling library for Visual Pinball Engine.
 
 ## Purpose
 
-Provides OS-level input polling to achieve sub-millisecond input latency by bypassing Unity's Input System buffer. The input polling runs on a dedicated thread at 500-2000 Hz and forwards events to the simulation thread via a lock-free ring buffer.
+Provides OS-level input polling to achieve sub-millisecond input latency by bypassing Unity's Input System buffer. The input polling runs on a dedicated thread at 500-2000 Hz and forwards events to the simulation thread via a callback.
 
 ## Architecture
 
@@ -18,8 +18,8 @@ Provides OS-level input polling to achieve sub-millisecond input latency by bypa
 │  (500-2000 Hz)                      │
 ├─────────────────────────────────────┤
 │  • GetAsyncKeyState (Windows)       │
-│  • evdev (Linux) [TODO]             │
-│  • IOKit (macOS) [TODO]             │
+│  • X11 key polling (Linux)          │
+│  • CoreGraphics/AppKit (macOS)      │
 └─────────────────────────────────────┘
               ↓
 ┌─────────────────────────────────────┐
@@ -36,7 +36,7 @@ Provides OS-level input polling to achieve sub-millisecond input latency by bypa
 ### Windows (Visual Studio 2022)
 
 ```bash
-cd VisualPinball.Unity.NativeInput
+cd VisualPinball.NativeInput
 mkdir build
 cd build
 cmake .. -G "Visual Studio 17 2022" -A x64
@@ -48,36 +48,42 @@ Output: `../VisualPinball.Engine/VisualPinball.Unity/VisualPinball.Unity/Plugins
 ### Windows (MinGW)
 
 ```bash
-cd VisualPinball.Unity.NativeInput
+cd VisualPinball.NativeInput
 mkdir build
 cd build
 cmake .. -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
 cmake --build .
 ```
 
-### Linux (TODO)
+### Linux
 
 ```bash
-cd VisualPinball.Unity.NativeInput
+cd VisualPinball.NativeInput
 mkdir build
 cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make
 ```
 
-Requires: `libevdev-dev` or `libinput-dev`
+Requires: `libx11-dev`
 
-### macOS (TODO)
+### macOS
 
 ```bash
-cd VisualPinball.Unity.NativeInput
+cd VisualPinball.NativeInput
 mkdir build
 cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make
 ```
 
-Requires: IOKit framework
+Requires: AppKit and ApplicationServices frameworks (provided by macOS)
+
+### CI / NuGet
+
+GitHub Actions builds `win-x64`, `win-x86`, `linux-x64`, `osx-x64`, and `osx-arm64` binaries and packs them into a single NuGet package.
+
+Publishing happens automatically for tags matching `v*`.
 
 ## Usage from C#
 
@@ -118,19 +124,19 @@ NativeInputApi.VpeInputShutdown();
 | Platform | Status | API Used |
 |----------|--------|----------|
 | Windows  | ✅ Implemented | GetAsyncKeyState, QueryPerformanceCounter |
-| Linux    | 🔲 TODO | evdev or libinput |
-| macOS    | 🔲 TODO | IOKit HID or CGEventTap |
+| Linux    | ✅ Implemented | X11 keyboard state polling |
+| macOS    | ✅ Implemented | CoreGraphics keyboard state polling |
 
 ## Performance
 
 - **Latency**: <0.1ms from physical input to event callback
 - **CPU Usage**: 5-10% of one core (mostly sleeping)
 - **Overhead**: ~10-20ns per P/Invoke call
-- **Precision**: Sub-microsecond timestamps (QueryPerformanceCounter)
+- **Precision**: Monotonic microsecond timestamps across platforms
 
 ## Future Enhancements
 
-1. **Gamepad support**: XInput (Windows), evdev (Linux), GCController (macOS)
+1. **Gamepad support**: XInput (Windows), SDL/libinput (Linux), GCController (macOS)
 2. **Analog inputs**: Plunger, steering, analog triggers
 3. **Force feedback**: Haptics for nudge, tilt, button feedback
 4. **Hot-plugging**: Detect device connect/disconnect

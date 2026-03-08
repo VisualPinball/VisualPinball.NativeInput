@@ -8,6 +8,7 @@
     <owners>Visual Pinball contributors</owners>
     <requireLicenseAcceptance>false</requireLicenseAcceptance>
     <license type="expression">GPL-3.0-or-later</license>
+    <icon>icon.png</icon>
     <readme>README.md</readme>
     <description>Cross-platform native keyboard polling library for Visual Pinball Engine.</description>
     <summary>Native keyboard polling for Visual Pinball Engine.</summary>
@@ -15,6 +16,7 @@
   </metadata>
   <files>
     <file src="_._" target="lib\netstandard2.1" />
+    <file src="icon.png" target="icon.png" />
     <file src="..\..\README.md" target="README.md" />
     <file src="..\..\artifacts\win-x64\VpeNativeInput.dll" target="runtimes\win-x64\native" />
     <file src="..\..\artifacts\win-x86\VpeNativeInput.dll" target="runtimes\win-x86\native" />

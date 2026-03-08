@@ -10,7 +10,7 @@ Provides OS-level input polling to achieve sub-millisecond input latency by bypa
 
 ```
 ┌─────────────────────────────────────┐
-│   OS Input Events (Keyboard/HID)   │
+│   OS Input Events (Keyboard/HID)    │
 └─────────────────────────────────────┘
               ↓
 ┌─────────────────────────────────────┐

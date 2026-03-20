@@ -72,6 +72,7 @@ endif()
 
 # Set output directory
 set_target_properties(VpeNativeInput PROPERTIES
+    OUTPUT_NAME "VisualPinball.NativeInput"
     LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR}
     RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_DIR}
     ARCHIVE_OUTPUT_DIRECTORY ${OUTPUT_DIR}

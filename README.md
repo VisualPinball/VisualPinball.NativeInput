@@ -43,7 +43,7 @@ cmake .. -G "Visual Studio 17 2022" -A x64
 cmake --build . --config Release
 ```
 
-Output: `../VisualPinball.Engine/VisualPinball.Unity/VisualPinball.Unity/Plugins/win-x64/VpeNativeInput.dll`
+Output: `../VisualPinball.Engine/VisualPinball.Unity/VisualPinball.Unity/Plugins/win-x64/VisualPinball.NativeInput.dll`
 
 ### Windows (MinGW)
 

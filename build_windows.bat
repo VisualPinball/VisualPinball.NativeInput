@@ -43,7 +43,7 @@ echo ========================================
 echo Build complete!
 echo ========================================
 echo.
-echo Output: VisualPinball.Engine\VisualPinball.Unity\VisualPinball.Unity\Plugins\win-x64\VpeNativeInput.dll
+echo Output: VisualPinball.Engine\VisualPinball.Unity\VisualPinball.Unity\Plugins\win-x64\VisualPinball.NativeInput.dll
 echo.
 echo Next steps:
 echo 1. Open Unity project

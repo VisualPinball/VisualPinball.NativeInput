@@ -123,10 +123,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: nuget/setup-nuget@v2
 
+      - name: Restore APT package cache
+        uses: actions/cache@v4
+        with:
+          path: .apt-cache/archives
+          key: ${{ runner.os }}-apt-mono-complete-v1
+
       - name: Install mono
         run: |
-          sudo apt-get update
-          sudo apt-get install -y mono-complete
+          APT_CACHE_DIR="$GITHUB_WORKSPACE/.apt-cache"
+          mkdir -p "$APT_CACHE_DIR/archives/partial"
+          sudo apt-get -o dir::cache::archives="$APT_CACHE_DIR/archives" update
+          sudo apt-get -o dir::cache::archives="$APT_CACHE_DIR/archives" install -y mono-complete
 
       - uses: actions/download-artifact@v4
         with:

@@ -8,9 +8,14 @@
 #include <thread>
 #include <atomic>
 #include <vector>
-#include <unordered_map>
 
 namespace {
+	struct KeyBindingState {
+		int keyCode;
+		VpeInputAction action;
+		float previousValue;
+	};
+
 	std::thread g_pollingThread;
 	std::atomic<bool> g_running(false);
 	VpeInputEventCallback g_callback = nullptr;
@@ -19,9 +24,8 @@ namespace {
 	HANDLE g_timer = NULL;
 	HANDLE g_stopEvent = NULL;
 
-	// Input bindings map: keyCode -> action
-	std::unordered_map<int, VpeInputAction> g_keyBindings;
-	std::unordered_map<int, float> g_keyStates; // Track previous state
+	// Input bindings: one key can map to multiple actions.
+	std::vector<KeyBindingState> g_bindings;
 
 	// High-resolution timing
 	LARGE_INTEGER g_frequency;
@@ -40,20 +44,19 @@ namespace {
 	}
 
 	void EmitReleaseForPressedKeys(int64_t timestampUsec) {
-		for (auto& [keyCode, previousValue] : g_keyStates) {
-			if (previousValue <= 0.0f) {
+		for (auto& binding : g_bindings) {
+			if (binding.previousValue <= 0.0f) {
 				continue;
 			}
 
-			previousValue = 0.0f;
-			auto binding = g_keyBindings.find(keyCode);
-			if (binding == g_keyBindings.end() || g_callback == nullptr) {
+			binding.previousValue = 0.0f;
+			if (g_callback == nullptr) {
 				continue;
 			}
 
 			VpeInputEvent event;
 			event.timestampUsec = timestampUsec;
-			event.action = static_cast<int32_t>(binding->second);
+			event.action = static_cast<int32_t>(binding.action);
 			event.value = 0.0f;
 			event._padding = 0;
 			g_callback(&event, g_userData);
@@ -97,23 +100,19 @@ namespace {
 			g_wasForeground = true;
 
 			// Poll all bound keys
-			for (const auto& [keyCode, action] : g_keyBindings) {
-				SHORT keyState = GetAsyncKeyState(keyCode);
+			for (auto& binding : g_bindings) {
+				SHORT keyState = GetAsyncKeyState(binding.keyCode);
 				bool isPressed = (keyState & 0x8000) != 0;
 				float currentValue = isPressed ? 1.0f : 0.0f;
 
-				// Check if state changed
-				auto it = g_keyStates.find(keyCode);
-				float previousValue = (it != g_keyStates.end()) ? it->second : 0.0f;
-
-				if (currentValue != previousValue) {
-					g_keyStates[keyCode] = currentValue;
+				if (currentValue != binding.previousValue) {
+					binding.previousValue = currentValue;
 
 					// Fire event
 					if (g_callback) {
 						VpeInputEvent event;
 						event.timestampUsec = timestampUsec;
-						event.action = static_cast<int32_t>(action);
+						event.action = static_cast<int32_t>(binding.action);
 						event.value = currentValue;
 						event._padding = 0;
 						g_callback(&event, g_userData);
@@ -160,8 +159,7 @@ VPE_API int VpeInputInit(void) {
 
 VPE_API void VpeInputShutdown(void) {
 	VpeInputStopPolling();
-	g_keyBindings.clear();
-	g_keyStates.clear();
+	g_bindings.clear();
 	if (g_timer != NULL) {
 		CloseHandle(g_timer);
 		g_timer = NULL;
@@ -173,14 +171,16 @@ VPE_API void VpeInputShutdown(void) {
 }
 
 VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count) {
-	g_keyBindings.clear();
-	g_keyStates.clear();
+	g_bindings.clear();
 	g_wasForeground = false;
 
 	for (int i = 0; i < count; i++) {
 		if (bindings[i].bindingType == VPE_BINDING_KEYBOARD) {
-			g_keyBindings[bindings[i].keyCode] = static_cast<VpeInputAction>(bindings[i].action);
-			g_keyStates[bindings[i].keyCode] = 0.0f; // Initialize to released
+			g_bindings.push_back({
+				bindings[i].keyCode,
+				static_cast<VpeInputAction>(bindings[i].action),
+				0.0f,
+			});
 		}
 		// TODO: Add gamepad support
 	}

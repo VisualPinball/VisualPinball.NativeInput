@@ -55,17 +55,98 @@ namespace {
 			case VPE_KEY_RCONTROL:
 				*nativeKeyCode = 62;
 				return true;
+			case VPE_KEY_LALT:
+				*nativeKeyCode = 58;
+				return true;
+			case VPE_KEY_RALT:
+				*nativeKeyCode = 61;
+				return true;
+			case VPE_KEY_ESCAPE:
+				*nativeKeyCode = 53;
+				return true;
 			case VPE_KEY_SPACE:
 				*nativeKeyCode = 49;
+				return true;
+			case VPE_KEY_PAGEUP:
+				*nativeKeyCode = 116;
+				return true;
+			case VPE_KEY_PAGEDOWN:
+				*nativeKeyCode = 121;
+				return true;
+			case VPE_KEY_END:
+				*nativeKeyCode = 119;
+				return true;
+			case VPE_KEY_HOME:
+				*nativeKeyCode = 115;
 				return true;
 			case VPE_KEY_RETURN:
 				*nativeKeyCode = 36;
 				return true;
+			case VPE_KEY_F1:
+				*nativeKeyCode = 122;
+				return true;
+			case VPE_KEY_F2:
+				*nativeKeyCode = 120;
+				return true;
+			case VPE_KEY_F3:
+				*nativeKeyCode = 99;
+				return true;
+			case VPE_KEY_F4:
+				*nativeKeyCode = 118;
+				return true;
+			case VPE_KEY_F5:
+				*nativeKeyCode = 96;
+				return true;
+			case VPE_KEY_F6:
+				*nativeKeyCode = 97;
+				return true;
+			case VPE_KEY_F7:
+				*nativeKeyCode = 98;
+				return true;
+			case VPE_KEY_F8:
+				*nativeKeyCode = 100;
+				return true;
+			case VPE_KEY_F9:
+				*nativeKeyCode = 101;
+				return true;
+			case VPE_KEY_F10:
+				*nativeKeyCode = 109;
+				return true;
+			case VPE_KEY_F11:
+				*nativeKeyCode = 103;
+				return true;
+			case VPE_KEY_F12:
+				*nativeKeyCode = 111;
+				return true;
+			case VPE_KEY_D0:
+				*nativeKeyCode = 29;
+				return true;
 			case VPE_KEY_D1:
 				*nativeKeyCode = 18;
 				return true;
+			case VPE_KEY_D2:
+				*nativeKeyCode = 19;
+				return true;
+			case VPE_KEY_D3:
+				*nativeKeyCode = 20;
+				return true;
+			case VPE_KEY_D4:
+				*nativeKeyCode = 21;
+				return true;
 			case VPE_KEY_D5:
 				*nativeKeyCode = 23;
+				return true;
+			case VPE_KEY_D6:
+				*nativeKeyCode = 22;
+				return true;
+			case VPE_KEY_D7:
+				*nativeKeyCode = 26;
+				return true;
+			case VPE_KEY_D8:
+				*nativeKeyCode = 28;
+				return true;
+			case VPE_KEY_D9:
+				*nativeKeyCode = 25;
 				return true;
 			case VPE_KEY_NUMPAD1:
 				*nativeKeyCode = 83;
@@ -73,14 +154,38 @@ namespace {
 			case VPE_KEY_A:
 				*nativeKeyCode = 0;
 				return true;
+			case VPE_KEY_B:
+				*nativeKeyCode = 11;
+				return true;
+			case VPE_KEY_O:
+				*nativeKeyCode = 31;
+				return true;
+			case VPE_KEY_P:
+				*nativeKeyCode = 35;
+				return true;
 			case VPE_KEY_S:
 				*nativeKeyCode = 1;
 				return true;
 			case VPE_KEY_D:
 				*nativeKeyCode = 2;
 				return true;
+			case VPE_KEY_T:
+				*nativeKeyCode = 17;
+				return true;
 			case VPE_KEY_W:
 				*nativeKeyCode = 13;
+				return true;
+			case VPE_KEY_Y:
+				*nativeKeyCode = 16;
+				return true;
+			case VPE_KEY_MINUS:
+				*nativeKeyCode = 27;
+				return true;
+			case VPE_KEY_QUOTE:
+				*nativeKeyCode = 39;
+				return true;
+			case VPE_KEY_CARET:
+				*nativeKeyCode = 50;
 				return true;
 			default:
 				return false;

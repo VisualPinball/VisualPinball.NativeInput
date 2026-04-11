@@ -57,24 +57,94 @@ namespace {
 				return XK_Control_L;
 			case VPE_KEY_RCONTROL:
 				return XK_Control_R;
+			case VPE_KEY_LALT:
+				return XK_Alt_L;
+			case VPE_KEY_RALT:
+				return XK_Alt_R;
+			case VPE_KEY_ESCAPE:
+				return XK_Escape;
 			case VPE_KEY_SPACE:
 				return XK_space;
+			case VPE_KEY_PAGEUP:
+				return XK_Prior;
+			case VPE_KEY_PAGEDOWN:
+				return XK_Next;
+			case VPE_KEY_HOME:
+				return XK_Home;
+			case VPE_KEY_END:
+				return XK_End;
 			case VPE_KEY_RETURN:
 				return XK_Return;
+			case VPE_KEY_F1:
+				return XK_F1;
+			case VPE_KEY_F2:
+				return XK_F2;
+			case VPE_KEY_F3:
+				return XK_F3;
+			case VPE_KEY_F4:
+				return XK_F4;
+			case VPE_KEY_F5:
+				return XK_F5;
+			case VPE_KEY_F6:
+				return XK_F6;
+			case VPE_KEY_F7:
+				return XK_F7;
+			case VPE_KEY_F8:
+				return XK_F8;
+			case VPE_KEY_F9:
+				return XK_F9;
+			case VPE_KEY_F10:
+				return XK_F10;
+			case VPE_KEY_F11:
+				return XK_F11;
+			case VPE_KEY_F12:
+				return XK_F12;
+			case VPE_KEY_D0:
+				return XK_0;
 			case VPE_KEY_D1:
 				return XK_1;
+			case VPE_KEY_D2:
+				return XK_2;
+			case VPE_KEY_D3:
+				return XK_3;
+			case VPE_KEY_D4:
+				return XK_4;
 			case VPE_KEY_D5:
 				return XK_5;
+			case VPE_KEY_D6:
+				return XK_6;
+			case VPE_KEY_D7:
+				return XK_7;
+			case VPE_KEY_D8:
+				return XK_8;
+			case VPE_KEY_D9:
+				return XK_9;
 			case VPE_KEY_NUMPAD1:
 				return XK_KP_1;
 			case VPE_KEY_A:
 				return XK_a;
+			case VPE_KEY_B:
+				return XK_b;
+			case VPE_KEY_O:
+				return XK_o;
+			case VPE_KEY_P:
+				return XK_p;
 			case VPE_KEY_S:
 				return XK_s;
 			case VPE_KEY_D:
 				return XK_d;
+			case VPE_KEY_T:
+				return XK_t;
 			case VPE_KEY_W:
 				return XK_w;
+			case VPE_KEY_Y:
+				return XK_y;
+			case VPE_KEY_MINUS:
+				return XK_minus;
+			case VPE_KEY_QUOTE:
+				return XK_apostrophe;
+			case VPE_KEY_CARET:
+				return XK_asciicircum;
 			default:
 				return NoSymbol;
 		}

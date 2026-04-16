@@ -1,6 +1,9 @@
 @echo off
 REM Build script for VpeNativeInput on Windows
 
+set SCRIPT_DIR=%~dp0
+set OUTPUT_DIR=%SCRIPT_DIR%artifacts\win-x64
+
 echo ========================================
 echo Building VpeNativeInput for Windows
 echo ========================================
@@ -19,7 +22,7 @@ cd build
 REM Configure CMake (Visual Studio 2022, x64)
 echo.
 echo Configuring CMake...
-cmake .. -G "Visual Studio 17 2022" -A x64
+cmake .. -G "Visual Studio 17 2022" -A x64 -DNATIVEINPUT_OUTPUT_DIR="%OUTPUT_DIR%"
 if %ERRORLEVEL% NEQ 0 (
     echo ERROR: CMake configuration failed.
     cd ..
@@ -43,11 +46,10 @@ echo ========================================
 echo Build complete!
 echo ========================================
 echo.
-echo Output: VisualPinball.Engine\VisualPinball.Unity\VisualPinball.Unity\Plugins\win-x64\VisualPinball.NativeInput.dll
+echo Output: artifacts\win-x64\VisualPinball.NativeInput.dll
 echo.
 echo Next steps:
-echo 1. Open Unity project
-echo 2. Add SimulationThreadComponent to your table GameObject
-echo 3. Enable "Enable Native Input" in Inspector
-echo 4. Press Play
+echo 1. Pack/publish VisualPinball.NativeInput NuGet package from artifacts
+echo 2. Update VisualPinball.Engine package version if needed
+echo 3. Build VisualPinball.Engine to copy binaries into Unity Plugins
 echo.

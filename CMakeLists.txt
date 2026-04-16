@@ -45,15 +45,18 @@ if(UNIX AND NOT APPLE)
 endif()
 
 # Set output directories based on platform
-set(VPE_NATIVEINPUT_OUTPUT_DIR "" CACHE PATH "Override output directory for built native binaries")
+# Defaults to artifacts/<rid> so this project stays independent of VPE.
+set(NATIVEINPUT_OUTPUT_DIR "" CACHE PATH "Override output directory for built native binaries")
+# Backward-compatible alias for old scripts/workflows.
+set(VPE_NATIVEINPUT_OUTPUT_DIR "" CACHE PATH "Deprecated alias for NATIVEINPUT_OUTPUT_DIR")
 
-if(VPE_NATIVEINPUT_OUTPUT_DIR)
-    set(OUTPUT_DIR "${VPE_NATIVEINPUT_OUTPUT_DIR}")
-elseif(WIN32)
+set(NATIVEINPUT_RID "")
+
+if(WIN32)
     if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-        set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/../VisualPinball.Engine/VisualPinball.Unity/VisualPinball.Unity/Plugins/win-x64")
+        set(NATIVEINPUT_RID "win-x64")
     else()
-        set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/../VisualPinball.Engine/VisualPinball.Unity/VisualPinball.Unity/Plugins/win-x86")
+        set(NATIVEINPUT_RID "win-x86")
     endif()
 elseif(APPLE)
     set(VPE_OSX_ARCH "${CMAKE_SYSTEM_PROCESSOR}")
@@ -62,13 +65,25 @@ elseif(APPLE)
     endif()
 
     if(VPE_OSX_ARCH MATCHES "^(arm64|aarch64)$")
-        set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/../VisualPinball.Engine/VisualPinball.Unity/VisualPinball.Unity/Plugins/osx/arm64")
+        set(NATIVEINPUT_RID "osx-arm64")
     else()
-        set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/../VisualPinball.Engine/VisualPinball.Unity/VisualPinball.Unity/Plugins/osx/x64")
+        set(NATIVEINPUT_RID "osx-x64")
     endif()
 elseif(UNIX)
-    set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/../VisualPinball.Engine/VisualPinball.Unity/VisualPinball.Unity/Plugins/linux-x64")
+    set(NATIVEINPUT_RID "linux-x64")
 endif()
+
+if(NATIVEINPUT_OUTPUT_DIR)
+    set(OUTPUT_DIR "${NATIVEINPUT_OUTPUT_DIR}")
+elseif(VPE_NATIVEINPUT_OUTPUT_DIR)
+    set(OUTPUT_DIR "${VPE_NATIVEINPUT_OUTPUT_DIR}")
+elseif(NATIVEINPUT_RID)
+    set(OUTPUT_DIR "${CMAKE_SOURCE_DIR}/artifacts/${NATIVEINPUT_RID}")
+else()
+    set(OUTPUT_DIR "${CMAKE_BINARY_DIR}/artifacts")
+endif()
+
+message(STATUS "NativeInput output directory: ${OUTPUT_DIR}")
 
 # Set output directory
 set_target_properties(VpeNativeInput PROPERTIES

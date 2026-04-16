@@ -43,7 +43,7 @@ cmake .. -G "Visual Studio 17 2022" -A x64
 cmake --build . --config Release
 ```
 
-Output: `../VisualPinball.Engine/VisualPinball.Unity/VisualPinball.Unity/Plugins/win-x64/VisualPinball.NativeInput.dll`
+Output: `artifacts/win-x64/VisualPinball.NativeInput.dll`
 
 ### Windows (MinGW)
 
@@ -84,6 +84,15 @@ Requires: AppKit and ApplicationServices frameworks (provided by macOS)
 GitHub Actions builds `win-x64`, `win-x86`, `linux-x64`, `osx-x64`, and `osx-arm64` binaries and packs them into a single NuGet package.
 
 Publishing happens automatically for tags matching `v*`.
+
+### Output directory override
+
+By default, builds are written to `artifacts/<rid>/`.
+
+You can override the output directory with:
+
+- `-DNATIVEINPUT_OUTPUT_DIR=/your/path` (preferred)
+- `-DVPE_NATIVEINPUT_OUTPUT_DIR=/your/path` (legacy alias)
 
 ## Usage from C#
 

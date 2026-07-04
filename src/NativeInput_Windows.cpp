@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -71,6 +72,7 @@ namespace {
 	HANDLE g_timer = NULL;
 	HANDLE g_stopEvent = NULL;
 
+	std::mutex g_bindingsMutex; // guards g_bindings and g_wasForeground between API calls and the polling thread
 	std::vector<KeyBindingState> g_bindings;
 	std::vector<HidDevice> g_hidDevices;
 
@@ -79,6 +81,9 @@ namespace {
 	bool g_wasForeground = false;
 
 	int64_t GetTimestampUsecInternal() {
+		if (g_frequency.QuadPart == 0) {
+			return 0;
+		}
 		LARGE_INTEGER now;
 		QueryPerformanceCounter(&now);
 		return ((now.QuadPart - g_startTime.QuadPart) * 1000000LL) / g_frequency.QuadPart;
@@ -215,6 +220,7 @@ namespace {
 		}
 	}
 
+	// Returns NaN for a null-state reading (device reports "no valid data" for the axis).
 	float NormalizeAxisValue(ULONG rawValue, const HIDP_VALUE_CAPS& valueCaps) {
 		const LONG logicalMin = valueCaps.LogicalMin;
 		const LONG logicalMax = valueCaps.LogicalMax;
@@ -222,7 +228,24 @@ namespace {
 			return 0.0f;
 		}
 
-		const float normalized = ((static_cast<float>(rawValue) - static_cast<float>(logicalMin))
+		// HidP_GetUsageValue returns the raw report bits in a ULONG without sign
+		// extension; devices with a signed logical range (accelerometers such as
+		// the Pinscape KL25Z) need it done manually from the report field width.
+		LONG value;
+		if (logicalMin < 0 && valueCaps.BitSize > 0 && valueCaps.BitSize < 32) {
+			const ULONG signBit = 1UL << (valueCaps.BitSize - 1);
+			const ULONG mask = (signBit << 1) - 1UL;
+			const ULONG masked = rawValue & mask;
+			value = (masked & signBit) ? static_cast<LONG>(masked | ~mask) : static_cast<LONG>(masked);
+		} else {
+			value = static_cast<LONG>(rawValue);
+		}
+
+		if (valueCaps.HasNull && (value < logicalMin || value > logicalMax)) {
+			return std::numeric_limits<float>::quiet_NaN();
+		}
+
+		const float normalized = ((static_cast<float>(value) - static_cast<float>(logicalMin))
 			/ (static_cast<float>(logicalMax) - static_cast<float>(logicalMin))) * 2.0f - 1.0f;
 		return std::clamp(normalized, -1.0f, 1.0f);
 	}
@@ -231,6 +254,11 @@ namespace {
 		if (device.handle != INVALID_HANDLE_VALUE) {
 			if (device.readPending) {
 				CancelIo(device.handle);
+				// Cancellation is asynchronous: the kernel keeps writing to the
+				// OVERLAPPED and report buffer until the IRP completes, so wait
+				// for completion before anything referencing them is freed.
+				DWORD bytesRead = 0;
+				GetOverlappedResult(device.handle, &device.readOverlap, &bytesRead, TRUE);
 				device.readPending = false;
 			}
 			CloseHandle(device.handle);
@@ -255,9 +283,12 @@ namespace {
 
 	bool OpenHidDevice(const std::wstring& path, bool overlapped, HidDevice& device) {
 		const DWORD flags = FILE_ATTRIBUTE_NORMAL | (overlapped ? FILE_FLAG_OVERLAPPED : 0);
+		// Listing only needs to query HID metadata, which works with zero access
+		// rights and doesn't clash with devices opened exclusively elsewhere.
+		const DWORD desiredAccess = overlapped ? GENERIC_READ : 0;
 		device.handle = CreateFileW(
 			path.c_str(),
-			GENERIC_READ,
+			desiredAccess,
 			FILE_SHARE_READ | FILE_SHARE_WRITE,
 			nullptr,
 			OPEN_EXISTING,
@@ -410,6 +441,9 @@ namespace {
 			}
 
 			const float normalized = NormalizeAxisValue(value, axis.valueCaps);
+			if (std::isnan(normalized)) {
+				continue;
+			}
 			axis.rawValue = normalized;
 			axis.timestampUsec = timestampUsec;
 			if (std::isnan(axis.previousValue) || std::fabs(normalized - axis.previousValue) > 0.0001f) {
@@ -474,21 +508,25 @@ namespace {
 			const int64_t timestampUsec = GetTimestampUsecInternal();
 			const bool isForeground = IsCurrentProcessForeground();
 			if (!isForeground) {
+				std::lock_guard<std::mutex> lock(g_bindingsMutex);
 				if (g_wasForeground) {
 					EmitReleaseForPressedKeys(timestampUsec);
 				}
 				g_wasForeground = false;
 			} else {
-				g_wasForeground = true;
+				{
+					std::lock_guard<std::mutex> lock(g_bindingsMutex);
+					g_wasForeground = true;
 
-				for (auto& binding : g_bindings) {
-					SHORT keyState = GetAsyncKeyState(binding.keyCode);
-					bool isPressed = (keyState & 0x8000) != 0;
-					float currentValue = isPressed ? 1.0f : 0.0f;
+					for (auto& binding : g_bindings) {
+						SHORT keyState = GetAsyncKeyState(binding.keyCode);
+						bool isPressed = (keyState & 0x8000) != 0;
+						float currentValue = isPressed ? 1.0f : 0.0f;
 
-					if (currentValue != binding.previousValue) {
-						binding.previousValue = currentValue;
-						EmitActionEvent(timestampUsec, binding.action, currentValue);
+						if (currentValue != binding.previousValue) {
+							binding.previousValue = currentValue;
+							EmitActionEvent(timestampUsec, binding.action, currentValue);
+						}
 					}
 				}
 
@@ -516,10 +554,14 @@ namespace {
 extern "C" {
 
 VPE_API int VpeInputInit(void) {
-	if (!QueryPerformanceFrequency(&g_frequency)) {
-		return 0;
+	// Only establish the timestamp epoch once; a re-init while a consumer is
+	// live must not make timestamps jump backwards.
+	if (g_frequency.QuadPart == 0) {
+		if (!QueryPerformanceFrequency(&g_frequency)) {
+			return 0;
+		}
+		QueryPerformanceCounter(&g_startTime);
 	}
-	QueryPerformanceCounter(&g_startTime);
 	if (g_timer == NULL) {
 		g_timer = CreateWaitableTimer(NULL, FALSE, NULL);
 	}
@@ -535,7 +577,10 @@ VPE_API int VpeInputGetProtocolVersion(void) {
 
 VPE_API void VpeInputShutdown(void) {
 	VpeInputStopPolling();
-	g_bindings.clear();
+	{
+		std::lock_guard<std::mutex> lock(g_bindingsMutex);
+		g_bindings.clear();
+	}
 	CloseHidDevices(g_hidDevices);
 	if (g_timer != NULL) {
 		CloseHandle(g_timer);
@@ -548,6 +593,7 @@ VPE_API void VpeInputShutdown(void) {
 }
 
 VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count) {
+	std::lock_guard<std::mutex> lock(g_bindingsMutex);
 	g_bindings.clear();
 	g_wasForeground = false;
 
@@ -601,6 +647,20 @@ VPE_API void VpeInputStopPolling(void) {
 }
 
 VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
+	// While polling is active, serve the polling snapshot: it is the only set of
+	// device indices consistent with the indices carried by axis events, and its
+	// axis values are live. A fresh enumeration may order devices differently.
+	if (g_running.load(std::memory_order_acquire)) {
+		const int count = static_cast<int>(g_hidDevices.size());
+		if (devices != nullptr && maxDevices > 0) {
+			const int copyCount = std::min(count, maxDevices);
+			for (int i = 0; i < copyCount; i++) {
+				CopyDeviceInfo(g_hidDevices[i], devices[i]);
+			}
+		}
+		return count;
+	}
+
 	std::vector<HidDevice> enumeratedDevices;
 	EnumerateHidDevices(enumeratedDevices, false);
 	const int count = static_cast<int>(enumeratedDevices.size());
@@ -615,6 +675,21 @@ VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
 }
 
 VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes) {
+	if (g_running.load(std::memory_order_acquire)) {
+		if (deviceIndex < 0 || deviceIndex >= static_cast<int>(g_hidDevices.size())) {
+			return 0;
+		}
+		const auto& device = g_hidDevices[deviceIndex];
+		const int count = static_cast<int>(device.axes.size());
+		if (axes != nullptr && maxAxes > 0) {
+			const int copyCount = std::min(count, maxAxes);
+			for (int i = 0; i < copyCount; i++) {
+				CopyAxisInfo(device.axes[i], axes[i]);
+			}
+		}
+		return count;
+	}
+
 	std::vector<HidDevice> enumeratedDevices;
 	EnumerateHidDevices(enumeratedDevices, false);
 	if (deviceIndex < 0 || deviceIndex >= static_cast<int>(enumeratedDevices.size())) {

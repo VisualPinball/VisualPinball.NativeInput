@@ -64,6 +64,12 @@ namespace {
 		bool readPending = false;
 	};
 
+	struct PendingAxisEvent {
+		int deviceIndex;
+		int axisId;
+		float value;
+	};
+
 	std::thread g_pollingThread;
 	std::atomic<bool> g_running(false);
 	VpeInputEventCallback g_callback = nullptr;
@@ -74,6 +80,7 @@ namespace {
 
 	std::mutex g_bindingsMutex; // guards g_bindings and g_wasForeground between API calls and the polling thread
 	std::vector<KeyBindingState> g_bindings;
+	std::mutex g_hidDevicesMutex; // guards the live polling device snapshot and axis telemetry
 	std::vector<HidDevice> g_hidDevices;
 
 	LARGE_INTEGER g_frequency;
@@ -253,10 +260,10 @@ namespace {
 	void CloseHidDevice(HidDevice& device) {
 		if (device.handle != INVALID_HANDLE_VALUE) {
 			if (device.readPending) {
-				CancelIo(device.handle);
-				// Cancellation is asynchronous: the kernel keeps writing to the
-				// OVERLAPPED and report buffer until the IRP completes, so wait
-				// for completion before anything referencing them is freed.
+				CancelIoEx(device.handle, &device.readOverlap);
+				// Cancellation is asynchronous and may be requested from a different
+				// thread than the ReadFile issuer, so use CancelIoEx and then wait for
+				// the IRP to stop touching the OVERLAPPED/report buffer.
 				DWORD bytesRead = 0;
 				GetOverlappedResult(device.handle, &device.readOverlap, &bytesRead, TRUE);
 				device.readPending = false;
@@ -418,7 +425,7 @@ namespace {
 		CopyString(destination.name, VPE_INPUT_AXIS_NAME_SIZE, AxisName(source.usage));
 	}
 
-	void ParseInputReport(HidDevice& device, int64_t timestampUsec) {
+	void ParseInputReport(HidDevice& device, int64_t timestampUsec, std::vector<PendingAxisEvent>& pendingEvents) {
 		if (device.preparsedData == nullptr || device.inputReport.empty()) {
 			return;
 		}
@@ -448,12 +455,12 @@ namespace {
 			axis.timestampUsec = timestampUsec;
 			if (std::isnan(axis.previousValue) || std::fabs(normalized - axis.previousValue) > 0.0001f) {
 				axis.previousValue = normalized;
-				EmitAxisEvent(timestampUsec, device.deviceIndex, axis.axisId, normalized);
+				pendingEvents.push_back({ device.deviceIndex, axis.axisId, normalized });
 			}
 		}
 	}
 
-	void StartHidRead(HidDevice& device, int64_t timestampUsec) {
+	void StartHidRead(HidDevice& device, int64_t timestampUsec, std::vector<PendingAxisEvent>& pendingEvents) {
 		if (device.handle == INVALID_HANDLE_VALUE || device.readPending || device.inputReport.empty()) {
 			return;
 		}
@@ -467,7 +474,7 @@ namespace {
 			&bytesRead,
 			&device.readOverlap);
 		if (ok) {
-			ParseInputReport(device, timestampUsec);
+			ParseInputReport(device, timestampUsec, pendingEvents);
 			return;
 		}
 
@@ -477,7 +484,7 @@ namespace {
 		}
 	}
 
-	void CompleteHidRead(HidDevice& device, int64_t timestampUsec) {
+	void CompleteHidRead(HidDevice& device, int64_t timestampUsec, std::vector<PendingAxisEvent>& pendingEvents) {
 		if (!device.readPending || device.readEvent == NULL) {
 			return;
 		}
@@ -489,14 +496,22 @@ namespace {
 		const BOOL ok = GetOverlappedResult(device.handle, &device.readOverlap, &bytesRead, FALSE);
 		device.readPending = false;
 		if (ok && bytesRead > 0) {
-			ParseInputReport(device, timestampUsec);
+			ParseInputReport(device, timestampUsec, pendingEvents);
 		}
 	}
 
-	void PollHidDevices(int64_t timestampUsec) {
-		for (auto& device : g_hidDevices) {
-			CompleteHidRead(device, timestampUsec);
-			StartHidRead(device, timestampUsec);
+	void PollHidDevices(int64_t timestampUsec, std::vector<PendingAxisEvent>& pendingEvents) {
+		pendingEvents.clear();
+		{
+			std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
+			for (auto& device : g_hidDevices) {
+				CompleteHidRead(device, timestampUsec, pendingEvents);
+				StartHidRead(device, timestampUsec, pendingEvents);
+			}
+		}
+
+		for (const auto& event : pendingEvents) {
+			EmitAxisEvent(timestampUsec, event.deviceIndex, event.axisId, event.value);
 		}
 	}
 
@@ -504,6 +519,7 @@ namespace {
 		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
 		const HANDLE handles[2] = { g_timer, g_stopEvent };
+		std::vector<PendingAxisEvent> pendingAxisEvents;
 		while (g_running.load(std::memory_order_acquire)) {
 			const int64_t timestampUsec = GetTimestampUsecInternal();
 			const bool isForeground = IsCurrentProcessForeground();
@@ -530,7 +546,7 @@ namespace {
 					}
 				}
 
-				PollHidDevices(timestampUsec);
+				PollHidDevices(timestampUsec, pendingAxisEvents);
 			}
 
 			if (g_pollIntervalUs > 0 && g_timer != NULL) {
@@ -581,7 +597,10 @@ VPE_API void VpeInputShutdown(void) {
 		std::lock_guard<std::mutex> lock(g_bindingsMutex);
 		g_bindings.clear();
 	}
-	CloseHidDevices(g_hidDevices);
+	{
+		std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
+		CloseHidDevices(g_hidDevices);
+	}
 	if (g_timer != NULL) {
 		CloseHandle(g_timer);
 		g_timer = NULL;
@@ -620,7 +639,10 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 	if (g_stopEvent != NULL) {
 		ResetEvent(g_stopEvent);
 	}
-	EnumerateHidDevices(g_hidDevices, true);
+	{
+		std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
+		EnumerateHidDevices(g_hidDevices, true);
+	}
 	g_running.store(true, std::memory_order_release);
 
 	try {
@@ -628,7 +650,10 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 		return 1;
 	} catch (...) {
 		g_running.store(false, std::memory_order_release);
-		CloseHidDevices(g_hidDevices);
+		{
+			std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
+			CloseHidDevices(g_hidDevices);
+		}
 		return 0;
 	}
 }
@@ -643,7 +668,10 @@ VPE_API void VpeInputStopPolling(void) {
 			g_pollingThread.join();
 		}
 	}
-	CloseHidDevices(g_hidDevices);
+	{
+		std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
+		CloseHidDevices(g_hidDevices);
+	}
 }
 
 VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
@@ -651,6 +679,7 @@ VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
 	// device indices consistent with the indices carried by axis events, and its
 	// axis values are live. A fresh enumeration may order devices differently.
 	if (g_running.load(std::memory_order_acquire)) {
+		std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
 		const int count = static_cast<int>(g_hidDevices.size());
 		if (devices != nullptr && maxDevices > 0) {
 			const int copyCount = std::min(count, maxDevices);
@@ -676,6 +705,7 @@ VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
 
 VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes) {
 	if (g_running.load(std::memory_order_acquire)) {
+		std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
 		if (deviceIndex < 0 || deviceIndex >= static_cast<int>(g_hidDevices.size())) {
 			return 0;
 		}

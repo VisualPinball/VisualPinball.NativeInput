@@ -178,8 +178,14 @@ namespace {
 			case VPE_KEY_Y:
 				*nativeKeyCode = 16;
 				return true;
+			case VPE_KEY_Z:
+				*nativeKeyCode = 6;
+				return true;
 			case VPE_KEY_MINUS:
 				*nativeKeyCode = 27;
+				return true;
+			case VPE_KEY_SLASH:
+				*nativeKeyCode = 44;
 				return true;
 			case VPE_KEY_QUOTE:
 				*nativeKeyCode = 39;
@@ -225,6 +231,7 @@ namespace {
 
 			VpeInputEvent event{};
 			event.timestampUsec = timestampUsec;
+			event.eventType = VPE_INPUT_EVENT_ACTION;
 			event.action = static_cast<int32_t>(binding.action);
 			event.value = 0.0f;
 			g_callback(&event, g_userData);
@@ -260,6 +267,7 @@ namespace {
 
 						VpeInputEvent event{};
 						event.timestampUsec = timestampUsec;
+						event.eventType = VPE_INPUT_EVENT_ACTION;
 						event.action = static_cast<int32_t>(binding.action);
 						event.value = currentValue;
 						g_callback(&event, g_userData);
@@ -282,6 +290,10 @@ VPE_API int VpeInputInit(void) {
 	g_startTime = Clock::now();
 	g_wasForeground = false;
 	return 1;
+}
+
+VPE_API int VpeInputGetProtocolVersion(void) {
+	return VPE_INPUT_PROTOCOL_VERSION;
 }
 
 VPE_API void VpeInputShutdown(void) {
@@ -346,6 +358,19 @@ VPE_API void VpeInputStopPolling(void) {
 	if (g_pollingThread.joinable()) {
 		g_pollingThread.join();
 	}
+}
+
+VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
+	(void)devices;
+	(void)maxDevices;
+	return 0;
+}
+
+VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes) {
+	(void)deviceIndex;
+	(void)axes;
+	(void)maxAxes;
+	return 0;
 }
 
 VPE_API int64_t VpeGetTimestampUsec(void) {

@@ -4,16 +4,63 @@
 #ifdef _WIN32
 
 #include "NativeInput.h"
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <windows.h>
-#include <thread>
+#include <hidsdi.h>
+#include <hidpi.h>
+#include <setupapi.h>
+
+#include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace {
+	constexpr USAGE UsagePageGenericDesktop = 0x01;
+	constexpr USAGE UsageJoystick = 0x04;
+	constexpr USAGE UsageGamepad = 0x05;
+	constexpr USAGE UsageMultiAxisController = 0x08;
+	constexpr USAGE UsageAxisMin = 0x30;
+	constexpr USAGE UsageAxisMax = 0x38;
+
 	struct KeyBindingState {
 		int keyCode;
 		VpeInputAction action;
 		float previousValue;
+	};
+
+	struct AxisDescriptor {
+		int axisId;
+		USAGE usagePage;
+		USAGE usage;
+		HIDP_VALUE_CAPS valueCaps;
+		float previousValue;
+		float rawValue;
+		int64_t timestampUsec;
+	};
+
+	struct HidDevice {
+		int deviceIndex;
+		std::wstring path;
+		std::string stableId;
+		std::string displayName;
+		HANDLE handle = INVALID_HANDLE_VALUE;
+		PHIDP_PREPARSED_DATA preparsedData = nullptr;
+		HIDP_CAPS caps = {};
+		std::vector<AxisDescriptor> axes;
+		std::vector<unsigned char> inputReport;
+		OVERLAPPED readOverlap = {};
+		HANDLE readEvent = NULL;
+		bool readPending = false;
 	};
 
 	std::thread g_pollingThread;
@@ -24,13 +71,18 @@ namespace {
 	HANDLE g_timer = NULL;
 	HANDLE g_stopEvent = NULL;
 
-	// Input bindings: one key can map to multiple actions.
 	std::vector<KeyBindingState> g_bindings;
+	std::vector<HidDevice> g_hidDevices;
 
-	// High-resolution timing
 	LARGE_INTEGER g_frequency;
 	LARGE_INTEGER g_startTime;
 	bool g_wasForeground = false;
+
+	int64_t GetTimestampUsecInternal() {
+		LARGE_INTEGER now;
+		QueryPerformanceCounter(&now);
+		return ((now.QuadPart - g_startTime.QuadPart) * 1000000LL) / g_frequency.QuadPart;
+	}
 
 	bool IsCurrentProcessForeground() {
 		HWND foreground = GetForegroundWindow();
@@ -43,6 +95,82 @@ namespace {
 		return foregroundPid == GetCurrentProcessId();
 	}
 
+	std::string Narrow(const std::wstring& value) {
+		if (value.empty()) {
+			return {};
+		}
+		const int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, nullptr, 0, nullptr, nullptr);
+		if (size <= 1) {
+			return {};
+		}
+		std::string result(static_cast<size_t>(size - 1), '\0');
+		WideCharToMultiByte(CP_UTF8, 0, value.c_str(), -1, result.data(), size, nullptr, nullptr);
+		return result;
+	}
+
+	void CopyString(char* destination, int destinationSize, const std::string& value) {
+		if (destination == nullptr || destinationSize <= 0) {
+			return;
+		}
+		const size_t count = std::min(static_cast<size_t>(destinationSize - 1), value.size());
+		if (count > 0) {
+			memcpy(destination, value.data(), count);
+		}
+		destination[count] = '\0';
+	}
+
+	const char* AxisName(USAGE usage) {
+		switch (usage) {
+			case 0x30: return "X";
+			case 0x31: return "Y";
+			case 0x32: return "Z";
+			case 0x33: return "RX";
+			case 0x34: return "RY";
+			case 0x35: return "RZ";
+			case 0x36: return "Slider";
+			case 0x37: return "Dial";
+			case 0x38: return "Wheel";
+			default: return "Axis";
+		}
+	}
+
+	bool IsSupportedAxis(USAGE usage) {
+		return usage >= UsageAxisMin && usage <= UsageAxisMax;
+	}
+
+	bool DeviceLooksLikeJoystick(const HIDP_CAPS& caps) {
+		return caps.UsagePage == UsagePageGenericDesktop
+			&& (caps.Usage == UsageJoystick || caps.Usage == UsageGamepad || caps.Usage == UsageMultiAxisController);
+	}
+
+	void EmitActionEvent(int64_t timestampUsec, VpeInputAction action, float value) {
+		if (g_callback == nullptr) {
+			return;
+		}
+
+		VpeInputEvent event{};
+		event.timestampUsec = timestampUsec;
+		event.eventType = VPE_INPUT_EVENT_ACTION;
+		event.action = static_cast<int32_t>(action);
+		event.value = value;
+		g_callback(&event, g_userData);
+	}
+
+	void EmitAxisEvent(int64_t timestampUsec, int deviceIndex, int axisId, float value) {
+		if (g_callback == nullptr) {
+			return;
+		}
+
+		VpeInputEvent event{};
+		event.timestampUsec = timestampUsec;
+		event.eventType = VPE_INPUT_EVENT_AXIS;
+		event.action = -1;
+		event.deviceIndex = deviceIndex;
+		event.axisId = axisId;
+		event.value = value;
+		g_callback(&event, g_userData);
+	}
+
 	void EmitReleaseForPressedKeys(int64_t timestampUsec) {
 		for (auto& binding : g_bindings) {
 			if (binding.previousValue <= 0.0f) {
@@ -50,85 +178,330 @@ namespace {
 			}
 
 			binding.previousValue = 0.0f;
-			if (g_callback == nullptr) {
-				continue;
-			}
-
-			VpeInputEvent event;
-			event.timestampUsec = timestampUsec;
-			event.action = static_cast<int32_t>(binding.action);
-			event.value = 0.0f;
-			event._padding = 0;
-			g_callback(&event, g_userData);
+			EmitActionEvent(timestampUsec, binding.action, 0.0f);
 		}
 	}
 
-	// Polling thread function
+	void AddAxisDescriptors(HidDevice& device, const HIDP_VALUE_CAPS& valueCaps, int& axisId) {
+		if (valueCaps.UsagePage != UsagePageGenericDesktop) {
+			return;
+		}
+
+		if (valueCaps.IsRange) {
+			for (USAGE usage = valueCaps.Range.UsageMin; usage <= valueCaps.Range.UsageMax; usage++) {
+				if (!IsSupportedAxis(usage)) {
+					continue;
+				}
+				device.axes.push_back({
+					axisId++,
+					valueCaps.UsagePage,
+					usage,
+					valueCaps,
+					std::numeric_limits<float>::quiet_NaN(),
+					0.0f,
+					0,
+				});
+			}
+		} else if (IsSupportedAxis(valueCaps.NotRange.Usage)) {
+			device.axes.push_back({
+				axisId++,
+				valueCaps.UsagePage,
+				valueCaps.NotRange.Usage,
+				valueCaps,
+				std::numeric_limits<float>::quiet_NaN(),
+				0.0f,
+				0,
+			});
+		}
+	}
+
+	float NormalizeAxisValue(ULONG rawValue, const HIDP_VALUE_CAPS& valueCaps) {
+		const LONG logicalMin = valueCaps.LogicalMin;
+		const LONG logicalMax = valueCaps.LogicalMax;
+		if (logicalMax == logicalMin) {
+			return 0.0f;
+		}
+
+		const float normalized = ((static_cast<float>(rawValue) - static_cast<float>(logicalMin))
+			/ (static_cast<float>(logicalMax) - static_cast<float>(logicalMin))) * 2.0f - 1.0f;
+		return std::clamp(normalized, -1.0f, 1.0f);
+	}
+
+	void CloseHidDevice(HidDevice& device) {
+		if (device.handle != INVALID_HANDLE_VALUE) {
+			if (device.readPending) {
+				CancelIo(device.handle);
+				device.readPending = false;
+			}
+			CloseHandle(device.handle);
+			device.handle = INVALID_HANDLE_VALUE;
+		}
+		if (device.readEvent != NULL) {
+			CloseHandle(device.readEvent);
+			device.readEvent = NULL;
+		}
+		if (device.preparsedData != nullptr) {
+			HidD_FreePreparsedData(device.preparsedData);
+			device.preparsedData = nullptr;
+		}
+	}
+
+	void CloseHidDevices(std::vector<HidDevice>& devices) {
+		for (auto& device : devices) {
+			CloseHidDevice(device);
+		}
+		devices.clear();
+	}
+
+	bool OpenHidDevice(const std::wstring& path, bool overlapped, HidDevice& device) {
+		const DWORD flags = FILE_ATTRIBUTE_NORMAL | (overlapped ? FILE_FLAG_OVERLAPPED : 0);
+		device.handle = CreateFileW(
+			path.c_str(),
+			GENERIC_READ,
+			FILE_SHARE_READ | FILE_SHARE_WRITE,
+			nullptr,
+			OPEN_EXISTING,
+			flags,
+			NULL);
+		if (device.handle == INVALID_HANDLE_VALUE) {
+			return false;
+		}
+
+		device.path = path;
+		device.stableId = Narrow(path);
+
+		wchar_t productString[128] = {};
+		if (HidD_GetProductString(device.handle, productString, sizeof(productString))) {
+			device.displayName = Narrow(productString);
+		}
+		if (device.displayName.empty()) {
+			HIDD_ATTRIBUTES attributes{};
+			attributes.Size = sizeof(attributes);
+			if (HidD_GetAttributes(device.handle, &attributes)) {
+				char buffer[64] = {};
+				snprintf(buffer, sizeof(buffer), "HID %04X:%04X", attributes.VendorID, attributes.ProductID);
+				device.displayName = buffer;
+			} else {
+				device.displayName = "HID joystick";
+			}
+		}
+
+		if (!HidD_GetPreparsedData(device.handle, &device.preparsedData)) {
+			CloseHidDevice(device);
+			return false;
+		}
+
+		if (HidP_GetCaps(device.preparsedData, &device.caps) != HIDP_STATUS_SUCCESS) {
+			CloseHidDevice(device);
+			return false;
+		}
+
+		std::vector<HIDP_VALUE_CAPS> valueCaps(device.caps.NumberInputValueCaps);
+		USHORT valueCapsLength = device.caps.NumberInputValueCaps;
+		if (valueCapsLength > 0 && HidP_GetValueCaps(HidP_Input, valueCaps.data(), &valueCapsLength, device.preparsedData) == HIDP_STATUS_SUCCESS) {
+			int axisId = 0;
+			for (USHORT i = 0; i < valueCapsLength; i++) {
+				AddAxisDescriptors(device, valueCaps[i], axisId);
+			}
+		}
+
+		if (!DeviceLooksLikeJoystick(device.caps)) {
+			CloseHidDevice(device);
+			return false;
+		}
+		if (device.axes.empty() || device.caps.InputReportByteLength == 0) {
+			CloseHidDevice(device);
+			return false;
+		}
+
+		device.inputReport.resize(device.caps.InputReportByteLength);
+		if (overlapped) {
+			device.readEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+			if (device.readEvent == NULL) {
+				CloseHidDevice(device);
+				return false;
+			}
+			device.readOverlap.hEvent = device.readEvent;
+		}
+		return true;
+	}
+
+	void EnumerateHidDevices(std::vector<HidDevice>& devices, bool openForPolling) {
+		CloseHidDevices(devices);
+
+		GUID hidGuid;
+		HidD_GetHidGuid(&hidGuid);
+		HDEVINFO deviceInfoSet = SetupDiGetClassDevsW(&hidGuid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+		if (deviceInfoSet == INVALID_HANDLE_VALUE) {
+			return;
+		}
+
+		for (DWORD index = 0;; index++) {
+			SP_DEVICE_INTERFACE_DATA interfaceData{};
+			interfaceData.cbSize = sizeof(interfaceData);
+			if (!SetupDiEnumDeviceInterfaces(deviceInfoSet, nullptr, &hidGuid, index, &interfaceData)) {
+				break;
+			}
+
+			DWORD requiredSize = 0;
+			SetupDiGetDeviceInterfaceDetailW(deviceInfoSet, &interfaceData, nullptr, 0, &requiredSize, nullptr);
+			if (requiredSize == 0) {
+				continue;
+			}
+
+			std::vector<unsigned char> detailBuffer(requiredSize);
+			auto* detailData = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(detailBuffer.data());
+			detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+			if (!SetupDiGetDeviceInterfaceDetailW(deviceInfoSet, &interfaceData, detailData, requiredSize, nullptr, nullptr)) {
+				continue;
+			}
+
+			HidDevice device{};
+			if (!OpenHidDevice(detailData->DevicePath, openForPolling, device)) {
+				continue;
+			}
+			device.deviceIndex = static_cast<int>(devices.size());
+			devices.push_back(std::move(device));
+		}
+
+		SetupDiDestroyDeviceInfoList(deviceInfoSet);
+	}
+
+	void CopyDeviceInfo(const HidDevice& source, VpeInputDeviceInfo& destination) {
+		destination = {};
+		destination.deviceIndex = source.deviceIndex;
+		destination.axisCount = static_cast<int32_t>(source.axes.size());
+		destination.isConnected = 1;
+		CopyString(destination.stableId, VPE_INPUT_DEVICE_ID_SIZE, source.stableId);
+		CopyString(destination.displayName, VPE_INPUT_DEVICE_NAME_SIZE, source.displayName);
+	}
+
+	void CopyAxisInfo(const AxisDescriptor& source, VpeInputAxisInfo& destination) {
+		destination = {};
+		destination.axisId = source.axisId;
+		destination.usagePage = source.usagePage;
+		destination.usage = source.usage;
+		destination.kind = VPE_AXIS_KIND_POSITION;
+		destination.rawValue = source.rawValue;
+		destination.timestampUsec = source.timestampUsec;
+		CopyString(destination.name, VPE_INPUT_AXIS_NAME_SIZE, AxisName(source.usage));
+	}
+
+	void ParseInputReport(HidDevice& device, int64_t timestampUsec) {
+		if (device.preparsedData == nullptr || device.inputReport.empty()) {
+			return;
+		}
+
+		auto* report = reinterpret_cast<PCHAR>(device.inputReport.data());
+		const ULONG reportLength = static_cast<ULONG>(device.inputReport.size());
+		for (auto& axis : device.axes) {
+			ULONG value = 0;
+			const NTSTATUS status = HidP_GetUsageValue(
+				HidP_Input,
+				axis.usagePage,
+				axis.valueCaps.LinkCollection,
+				axis.usage,
+				&value,
+				device.preparsedData,
+				report,
+				reportLength);
+			if (status != HIDP_STATUS_SUCCESS) {
+				continue;
+			}
+
+			const float normalized = NormalizeAxisValue(value, axis.valueCaps);
+			axis.rawValue = normalized;
+			axis.timestampUsec = timestampUsec;
+			if (std::isnan(axis.previousValue) || std::fabs(normalized - axis.previousValue) > 0.0001f) {
+				axis.previousValue = normalized;
+				EmitAxisEvent(timestampUsec, device.deviceIndex, axis.axisId, normalized);
+			}
+		}
+	}
+
+	void StartHidRead(HidDevice& device, int64_t timestampUsec) {
+		if (device.handle == INVALID_HANDLE_VALUE || device.readPending || device.inputReport.empty()) {
+			return;
+		}
+
+		ResetEvent(device.readEvent);
+		DWORD bytesRead = 0;
+		const BOOL ok = ReadFile(
+			device.handle,
+			device.inputReport.data(),
+			static_cast<DWORD>(device.inputReport.size()),
+			&bytesRead,
+			&device.readOverlap);
+		if (ok) {
+			ParseInputReport(device, timestampUsec);
+			return;
+		}
+
+		const DWORD error = GetLastError();
+		if (error == ERROR_IO_PENDING) {
+			device.readPending = true;
+		}
+	}
+
+	void CompleteHidRead(HidDevice& device, int64_t timestampUsec) {
+		if (!device.readPending || device.readEvent == NULL) {
+			return;
+		}
+		if (WaitForSingleObject(device.readEvent, 0) != WAIT_OBJECT_0) {
+			return;
+		}
+
+		DWORD bytesRead = 0;
+		const BOOL ok = GetOverlappedResult(device.handle, &device.readOverlap, &bytesRead, FALSE);
+		device.readPending = false;
+		if (ok && bytesRead > 0) {
+			ParseInputReport(device, timestampUsec);
+		}
+	}
+
+	void PollHidDevices(int64_t timestampUsec) {
+		for (auto& device : g_hidDevices) {
+			CompleteHidRead(device, timestampUsec);
+			StartHidRead(device, timestampUsec);
+		}
+	}
+
 	void PollingThreadFunc() {
 		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
 		const HANDLE handles[2] = { g_timer, g_stopEvent };
 		while (g_running.load(std::memory_order_acquire)) {
-			LARGE_INTEGER now;
-			QueryPerformanceCounter(&now);
-			int64_t timestampUsec = ((now.QuadPart - g_startTime.QuadPart) * 1000000LL) / g_frequency.QuadPart;
-
-			bool isForeground = IsCurrentProcessForeground();
+			const int64_t timestampUsec = GetTimestampUsecInternal();
+			const bool isForeground = IsCurrentProcessForeground();
 			if (!isForeground) {
 				if (g_wasForeground) {
 					EmitReleaseForPressedKeys(timestampUsec);
 				}
 				g_wasForeground = false;
+			} else {
+				g_wasForeground = true;
 
-				if (g_pollIntervalUs > 0 && g_timer != NULL) {
-					LARGE_INTEGER dueTime;
-					dueTime.QuadPart = -(static_cast<LONGLONG>(g_pollIntervalUs) * 10);
-					SetWaitableTimer(g_timer, &dueTime, 0, NULL, NULL, FALSE);
-					DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
-					if (waitResult == WAIT_OBJECT_0 + 1) {
-						break;
-					}
-				} else {
-					DWORD waitResult = WaitForSingleObject(g_stopEvent, 1);
-					if (waitResult == WAIT_OBJECT_0) {
-						break;
+				for (auto& binding : g_bindings) {
+					SHORT keyState = GetAsyncKeyState(binding.keyCode);
+					bool isPressed = (keyState & 0x8000) != 0;
+					float currentValue = isPressed ? 1.0f : 0.0f;
+
+					if (currentValue != binding.previousValue) {
+						binding.previousValue = currentValue;
+						EmitActionEvent(timestampUsec, binding.action, currentValue);
 					}
 				}
-				continue;
+
+				PollHidDevices(timestampUsec);
 			}
 
-			g_wasForeground = true;
-
-			// Poll all bound keys
-			for (auto& binding : g_bindings) {
-				SHORT keyState = GetAsyncKeyState(binding.keyCode);
-				bool isPressed = (keyState & 0x8000) != 0;
-				float currentValue = isPressed ? 1.0f : 0.0f;
-
-				if (currentValue != binding.previousValue) {
-					binding.previousValue = currentValue;
-
-					// Fire event
-					if (g_callback) {
-						VpeInputEvent event;
-						event.timestampUsec = timestampUsec;
-						event.action = static_cast<int32_t>(binding.action);
-						event.value = currentValue;
-						event._padding = 0;
-						g_callback(&event, g_userData);
-					}
-				}
-			}
-
-			// Wait for next poll interval or stop event.
 			if (g_pollIntervalUs > 0 && g_timer != NULL) {
-				// Relative due time in 100ns units (negative = relative)
 				LARGE_INTEGER dueTime;
 				dueTime.QuadPart = -(static_cast<LONGLONG>(g_pollIntervalUs) * 10);
 				SetWaitableTimer(g_timer, &dueTime, 0, NULL, NULL, FALSE);
 				DWORD waitResult = WaitForMultipleObjects(2, handles, FALSE, INFINITE);
 				if (waitResult == WAIT_OBJECT_0 + 1) {
-					break; // stop event
+					break;
 				}
 			} else {
 				DWORD waitResult = WaitForSingleObject(g_stopEvent, 1);
@@ -143,7 +516,6 @@ namespace {
 extern "C" {
 
 VPE_API int VpeInputInit(void) {
-	// Initialize high-resolution timer
 	if (!QueryPerformanceFrequency(&g_frequency)) {
 		return 0;
 	}
@@ -157,9 +529,14 @@ VPE_API int VpeInputInit(void) {
 	return 1;
 }
 
+VPE_API int VpeInputGetProtocolVersion(void) {
+	return VPE_INPUT_PROTOCOL_VERSION;
+}
+
 VPE_API void VpeInputShutdown(void) {
 	VpeInputStopPolling();
 	g_bindings.clear();
+	CloseHidDevices(g_hidDevices);
 	if (g_timer != NULL) {
 		CloseHandle(g_timer);
 		g_timer = NULL;
@@ -182,13 +559,12 @@ VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count) {
 				0.0f,
 			});
 		}
-		// TODO: Add gamepad support
 	}
 }
 
 VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData, int pollIntervalUs) {
 	if (g_running.load(std::memory_order_acquire)) {
-		return 0; // Already running
+		return 0;
 	}
 
 	g_callback = callback;
@@ -198,6 +574,7 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 	if (g_stopEvent != NULL) {
 		ResetEvent(g_stopEvent);
 	}
+	EnumerateHidDevices(g_hidDevices, true);
 	g_running.store(true, std::memory_order_release);
 
 	try {
@@ -205,6 +582,7 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 		return 1;
 	} catch (...) {
 		g_running.store(false, std::memory_order_release);
+		CloseHidDevices(g_hidDevices);
 		return 0;
 	}
 }
@@ -219,12 +597,45 @@ VPE_API void VpeInputStopPolling(void) {
 			g_pollingThread.join();
 		}
 	}
+	CloseHidDevices(g_hidDevices);
+}
+
+VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
+	std::vector<HidDevice> enumeratedDevices;
+	EnumerateHidDevices(enumeratedDevices, false);
+	const int count = static_cast<int>(enumeratedDevices.size());
+	if (devices != nullptr && maxDevices > 0) {
+		const int copyCount = std::min(count, maxDevices);
+		for (int i = 0; i < copyCount; i++) {
+			CopyDeviceInfo(enumeratedDevices[i], devices[i]);
+		}
+	}
+	CloseHidDevices(enumeratedDevices);
+	return count;
+}
+
+VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes) {
+	std::vector<HidDevice> enumeratedDevices;
+	EnumerateHidDevices(enumeratedDevices, false);
+	if (deviceIndex < 0 || deviceIndex >= static_cast<int>(enumeratedDevices.size())) {
+		CloseHidDevices(enumeratedDevices);
+		return 0;
+	}
+
+	const auto& device = enumeratedDevices[deviceIndex];
+	const int count = static_cast<int>(device.axes.size());
+	if (axes != nullptr && maxAxes > 0) {
+		const int copyCount = std::min(count, maxAxes);
+		for (int i = 0; i < copyCount; i++) {
+			CopyAxisInfo(device.axes[i], axes[i]);
+		}
+	}
+	CloseHidDevices(enumeratedDevices);
+	return count;
 }
 
 VPE_API int64_t VpeGetTimestampUsec(void) {
-	LARGE_INTEGER now;
-	QueryPerformanceCounter(&now);
-	return ((now.QuadPart - g_startTime.QuadPart) * 1000000LL) / g_frequency.QuadPart;
+	return GetTimestampUsecInternal();
 }
 
 VPE_API void VpeSetThreadPriority(void) {

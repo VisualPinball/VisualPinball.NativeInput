@@ -14,6 +14,10 @@ VPE_API int VpeInputInit(void) {
 	return 0; // Not implemented
 }
 
+VPE_API int VpeInputGetProtocolVersion(void) {
+	return VPE_INPUT_PROTOCOL_VERSION;
+}
+
 VPE_API void VpeInputShutdown(void) {
 	// TODO
 }
@@ -29,6 +33,19 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 
 VPE_API void VpeInputStopPolling(void) {
 	// TODO
+}
+
+VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
+	(void)devices;
+	(void)maxDevices;
+	return 0;
+}
+
+VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes) {
+	(void)deviceIndex;
+	(void)axes;
+	(void)maxAxes;
+	return 0;
 }
 
 VPE_API int64_t VpeGetTimestampUsec(void) {

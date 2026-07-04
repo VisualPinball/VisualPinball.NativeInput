@@ -139,8 +139,12 @@ namespace {
 				return XK_w;
 			case VPE_KEY_Y:
 				return XK_y;
+			case VPE_KEY_Z:
+				return XK_z;
 			case VPE_KEY_MINUS:
 				return XK_minus;
+			case VPE_KEY_SLASH:
+				return XK_slash;
 			case VPE_KEY_QUOTE:
 				return XK_apostrophe;
 			case VPE_KEY_CARET:
@@ -261,6 +265,7 @@ namespace {
 
 			VpeInputEvent event{};
 			event.timestampUsec = timestampUsec;
+			event.eventType = VPE_INPUT_EVENT_ACTION;
 			event.action = static_cast<int32_t>(binding.action);
 			event.value = 0.0f;
 			g_callback(&event, g_userData);
@@ -298,6 +303,7 @@ namespace {
 
 					VpeInputEvent event{};
 					event.timestampUsec = timestampUsec;
+					event.eventType = VPE_INPUT_EVENT_ACTION;
 					event.action = static_cast<int32_t>(binding.action);
 					event.value = currentValue;
 					g_callback(&event, g_userData);
@@ -326,6 +332,10 @@ VPE_API int VpeInputInit(void) {
 	g_wmPidAtom = XInternAtom(g_display, "_NET_WM_PID", True);
 	g_wasForeground = false;
 	return 1;
+}
+
+VPE_API int VpeInputGetProtocolVersion(void) {
+	return VPE_INPUT_PROTOCOL_VERSION;
 }
 
 VPE_API void VpeInputShutdown(void) {
@@ -400,6 +410,19 @@ VPE_API void VpeInputStopPolling(void) {
 	if (g_pollingThread.joinable()) {
 		g_pollingThread.join();
 	}
+}
+
+VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
+	(void)devices;
+	(void)maxDevices;
+	return 0;
+}
+
+VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes) {
+	(void)deviceIndex;
+	(void)axes;
+	(void)maxAxes;
+	return 0;
 }
 
 VPE_API int64_t VpeGetTimestampUsec(void) {

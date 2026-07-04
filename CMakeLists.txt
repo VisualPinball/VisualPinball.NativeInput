@@ -18,7 +18,7 @@ set(SOURCES
 # Platform-specific sources
 if(WIN32)
     list(APPEND SOURCES src/NativeInput_Windows.cpp)
-    set(PLATFORM_LIBS winmm hid setupapi)
+    set(PLATFORM_LIBS winmm hid setupapi cfgmgr32)
 elseif(APPLE)
     list(APPEND SOURCES src/NativeInput_Mac.mm)
     find_library(APPKIT_FRAMEWORK AppKit REQUIRED)

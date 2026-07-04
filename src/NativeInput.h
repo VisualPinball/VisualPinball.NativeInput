@@ -67,12 +67,26 @@ typedef enum {
 	VPE_INPUT_MAX = 64  // Reserve space for future actions
 } VpeInputAction;
 
+// ABI protocol version. Increment when struct layouts change.
+#define VPE_INPUT_PROTOCOL_VERSION 2
+
 // Input binding type
 typedef enum {
 	VPE_BINDING_KEYBOARD = 0,
 	VPE_BINDING_GAMEPAD = 1,
 	VPE_BINDING_MOUSE = 2
 } VpeBindingType;
+
+typedef enum {
+	VPE_INPUT_EVENT_ACTION = 0,
+	VPE_INPUT_EVENT_AXIS = 1
+} VpeInputEventType;
+
+typedef enum {
+	VPE_AXIS_KIND_POSITION = 0,
+	VPE_AXIS_KIND_VELOCITY = 1,
+	VPE_AXIS_KIND_ACCELERATION = 2
+} VpeAxisKind;
 
 // Key codes (Windows virtual key codes, mapped on other platforms)
 typedef enum {
@@ -117,6 +131,7 @@ typedef enum {
 	VPE_KEY_P = 0x50,
 	VPE_KEY_T = 0x54,
 	VPE_KEY_Y = 0x59,
+	VPE_KEY_Z = 0x5A,
 	VPE_KEY_NUMPAD1 = 0x61,
 	VPE_KEY_A = 0x41,
 	VPE_KEY_B = 0x42,
@@ -124,16 +139,46 @@ typedef enum {
 	VPE_KEY_D = 0x44,
 	VPE_KEY_W = 0x57,
 	VPE_KEY_MINUS = 0xBD, // VK_OEM_MINUS
+	VPE_KEY_SLASH = 0xBF, // VK_OEM_2
 	VPE_KEY_QUOTE = 0xDE, // VK_OEM_7
 	VPE_KEY_CARET = 0xC0, // VK_OEM_3 (layout dependent)
 } VpeKeyCode;
 
+#define VPE_INPUT_DEVICE_ID_SIZE 260
+#define VPE_INPUT_DEVICE_NAME_SIZE 128
+#define VPE_INPUT_AXIS_NAME_SIZE 32
+
+// Input device descriptor (matches C# struct layout)
+typedef struct {
+	int32_t deviceIndex;
+	int32_t axisCount;
+	int32_t isConnected;
+	int32_t _padding;
+	char stableId[VPE_INPUT_DEVICE_ID_SIZE];
+	char displayName[VPE_INPUT_DEVICE_NAME_SIZE];
+} VpeInputDeviceInfo;
+
+// Input axis descriptor (matches C# struct layout)
+typedef struct {
+	int32_t axisId;
+	int32_t usagePage;
+	int32_t usage;
+	int32_t kind;
+	float rawValue;
+	int32_t _padding;
+	int64_t timestampUsec;
+	char name[VPE_INPUT_AXIS_NAME_SIZE];
+} VpeInputAxisInfo;
+
 // Input event structure (matches C# struct layout)
 typedef struct {
 	int64_t timestampUsec;  // Microsecond timestamp
-	int32_t action;         // VpeInputAction
-	float value;            // 0.0 (released) or 1.0 (pressed), or analog value
-	int32_t _padding;       // Ensure 16-byte alignment
+	int32_t eventType;      // VpeInputEventType
+	int32_t action;         // VpeInputAction for action events
+	int32_t deviceIndex;    // device index for axis events
+	int32_t axisId;         // axis id for axis events
+	float value;            // 0.0/1.0 for buttons, -1.0..1.0 for axes
+	int32_t _padding;
 } VpeInputEvent;
 
 // Input binding structure
@@ -151,6 +196,9 @@ typedef void (*VpeInputEventCallback)(const VpeInputEvent* event, void* userData
 // Returns 1 on success, 0 on failure
 VPE_API int VpeInputInit(void);
 
+// Native ABI protocol version
+VPE_API int VpeInputGetProtocolVersion(void);
+
 // Shutdown input system
 VPE_API void VpeInputShutdown(void);
 
@@ -167,6 +215,14 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 
 // Stop polling thread
 VPE_API void VpeInputStopPolling(void);
+
+// List HID joystick/gamepad-style devices with analog axes.
+// Returns the total available device count. Copies up to maxDevices entries when devices is non-null.
+VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices);
+
+// List axes for a device index returned by VpeInputListDevices.
+// Returns the total available axis count. Copies up to maxAxes entries when axes is non-null.
+VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes);
 
 // Get high-resolution timestamp in microseconds
 VPE_API int64_t VpeGetTimestampUsec(void);

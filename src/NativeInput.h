@@ -199,7 +199,9 @@ typedef void (*VpeInputEventCallback)(const VpeInputEvent* event, void* userData
 // Returns 1 on success, 0 on failure
 VPE_API int VpeInputInit(void);
 
-// Native ABI protocol version
+// Native ABI protocol version. Call after VpeInputInit and verify the returned
+// value before starting polling; VpeInputStartPolling fails until this has been
+// acknowledged.
 VPE_API int VpeInputGetProtocolVersion(void);
 
 // Shutdown input system

@@ -101,6 +101,9 @@ using VisualPinball.Unity.Simulation;
 
 // Initialize
 NativeInputApi.VpeInputInit();
+if (NativeInputApi.VpeInputGetProtocolVersion() != 2) {
+    throw new InvalidOperationException("Unsupported native input protocol.");
+}
 
 // Set bindings
 var bindings = new[] {

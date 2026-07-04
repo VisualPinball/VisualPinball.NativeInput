@@ -37,6 +37,10 @@ endif()
 # Create shared library
 add_library(VpeNativeInput SHARED ${SOURCES})
 
+if(WIN32)
+    target_compile_definitions(VpeNativeInput PRIVATE WINVER=0x0600 _WIN32_WINNT=0x0600)
+endif()
+
 # Link platform libraries
 target_link_libraries(VpeNativeInput PRIVATE ${PLATFORM_LIBS})
 

@@ -74,6 +74,7 @@ namespace {
 
 	std::thread g_pollingThread;
 	std::atomic<bool> g_running(false);
+	std::atomic<bool> g_protocolVersionChecked(false);
 	VpeInputEventCallback g_callback = nullptr;
 	void* g_userData = nullptr;
 	int g_pollIntervalUs = 500;
@@ -761,6 +762,8 @@ namespace {
 extern "C" {
 
 VPE_API int VpeInputInit(void) {
+	g_protocolVersionChecked.store(false, std::memory_order_release);
+
 	// Only establish the timestamp epoch once; a re-init while a consumer is
 	// live must not make timestamps jump backwards.
 	if (g_frequency.QuadPart == 0) {
@@ -779,11 +782,13 @@ VPE_API int VpeInputInit(void) {
 }
 
 VPE_API int VpeInputGetProtocolVersion(void) {
+	g_protocolVersionChecked.store(true, std::memory_order_release);
 	return VPE_INPUT_PROTOCOL_VERSION;
 }
 
 VPE_API void VpeInputShutdown(void) {
 	VpeInputStopPolling();
+	g_protocolVersionChecked.store(false, std::memory_order_release);
 	{
 		std::lock_guard<std::mutex> lock(g_bindingsMutex);
 		g_bindings.clear();
@@ -819,7 +824,7 @@ VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count) {
 }
 
 VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData, int pollIntervalUs) {
-	if (g_running.load(std::memory_order_acquire)) {
+	if (!g_protocolVersionChecked.load(std::memory_order_acquire) || g_running.load(std::memory_order_acquire)) {
 		return 0;
 	}
 

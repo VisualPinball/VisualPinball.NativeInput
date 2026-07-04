@@ -79,7 +79,10 @@ typedef enum {
 
 typedef enum {
 	VPE_INPUT_EVENT_ACTION = 0,
-	VPE_INPUT_EVENT_AXIS = 1
+	VPE_INPUT_EVENT_AXIS = 1,
+	// The set of available devices changed (hotplug); consumers should refresh
+	// their device list. Carries no payload besides the timestamp.
+	VPE_INPUT_EVENT_DEVICES_CHANGED = 2
 } VpeInputEventType;
 
 typedef enum {

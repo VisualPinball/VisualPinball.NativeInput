@@ -13,6 +13,7 @@
 #include <hidsdi.h>
 #include <hidpi.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
 
 #include <algorithm>
 #include <atomic>
@@ -62,6 +63,7 @@ namespace {
 		OVERLAPPED readOverlap = {};
 		HANDLE readEvent = NULL;
 		bool readPending = false;
+		bool isConnected = true;
 	};
 
 	struct PendingAxisEvent {
@@ -82,6 +84,13 @@ namespace {
 	std::vector<KeyBindingState> g_bindings;
 	std::mutex g_hidDevicesMutex; // guards the live polling device snapshot and axis telemetry
 	std::vector<HidDevice> g_hidDevices;
+
+	// Hotplug handling (polling thread only, except the atomic request flag):
+	// a cheap present-interface probe runs every couple of seconds, and a full
+	// reconciliation runs when the probe result changes or a read failed.
+	constexpr int64_t HotplugCheckIntervalUsec = 2000000;
+	std::atomic<bool> g_hotplugCheckRequested(false);
+	std::wstring g_lastHidInterfaceList;
 
 	LARGE_INTEGER g_frequency;
 	LARGE_INTEGER g_startTime;
@@ -180,6 +189,18 @@ namespace {
 		event.deviceIndex = deviceIndex;
 		event.axisId = axisId;
 		event.value = value;
+		g_callback(&event, g_userData);
+	}
+
+	void EmitDevicesChangedEvent(int64_t timestampUsec) {
+		if (g_callback == nullptr) {
+			return;
+		}
+
+		VpeInputEvent event{};
+		event.timestampUsec = timestampUsec;
+		event.eventType = VPE_INPUT_EVENT_DEVICES_CHANGED;
+		event.action = -1;
 		g_callback(&event, g_userData);
 	}
 
@@ -286,6 +307,55 @@ namespace {
 			CloseHidDevice(device);
 		}
 		devices.clear();
+	}
+
+	// Releases the device's handles but keeps its identity (path, name, axes) and
+	// deviceIndex, so the slot can be reported as disconnected and reopened in
+	// place when the device comes back.
+	void DisconnectHidDevice(HidDevice& device) {
+		CloseHidDevice(device);
+		device.isConnected = false;
+	}
+
+	std::wstring ToLower(const std::wstring& value) {
+		std::wstring result(value);
+		for (auto& c : result) {
+			c = towlower(c);
+		}
+		return result;
+	}
+
+	// Returns the multi-sz list of present HID interface paths — much cheaper
+	// than a SetupDi enumeration, so it can serve as a periodic change probe.
+	std::wstring GetHidInterfaceList() {
+		GUID hidGuid;
+		HidD_GetHidGuid(&hidGuid);
+		for (int attempt = 0; attempt < 3; attempt++) {
+			ULONG length = 0;
+			if (CM_Get_Device_Interface_List_SizeW(&length, &hidGuid, nullptr, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) != CR_SUCCESS || length <= 1) {
+				return {};
+			}
+			std::wstring buffer(length, L'\0');
+			const CONFIGRET result = CM_Get_Device_Interface_ListW(&hidGuid, nullptr, buffer.data(), length, CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+			if (result == CR_SUCCESS) {
+				return buffer;
+			}
+			if (result != CR_BUFFER_SMALL) { // list grew between the two calls: retry
+				return {};
+			}
+		}
+		return {};
+	}
+
+	std::vector<std::wstring> ParseInterfaceList(const std::wstring& multiSz) {
+		std::vector<std::wstring> paths;
+		size_t offset = 0;
+		while (offset < multiSz.size() && multiSz[offset] != L'\0') {
+			const size_t end = multiSz.find(L'\0', offset);
+			paths.emplace_back(multiSz.substr(offset, end - offset));
+			offset = (end == std::wstring::npos) ? multiSz.size() : end + 1;
+		}
+		return paths;
 	}
 
 	bool OpenHidDevice(const std::wstring& path, bool overlapped, HidDevice& device) {
@@ -405,11 +475,80 @@ namespace {
 		SetupDiDestroyDeviceInfoList(deviceInfoSet);
 	}
 
+	// Reopens a previously disconnected device in its existing slot, keeping the
+	// deviceIndex stable. Axis ids stay stable too, since the same descriptor
+	// yields the same axis enumeration order.
+	bool ReopenHidDevice(HidDevice& device) {
+		HidDevice fresh{};
+		if (!OpenHidDevice(device.path, true, fresh)) {
+			return false;
+		}
+		fresh.deviceIndex = device.deviceIndex;
+		device = std::move(fresh);
+		return true;
+	}
+
+	// Aligns g_hidDevices with the currently present HID interfaces: missing
+	// devices are disconnected (their slot and deviceIndex are kept), re-plugged
+	// devices are reopened in place, and new joystick-style devices are appended.
+	// Returns true if anything changed; sets retryPending when a present device
+	// could not be reopened (transient open failure) so the caller can try again.
+	// Caller holds g_hidDevicesMutex.
+	bool ReconcileHidDevices(const std::vector<std::wstring>& presentPaths, bool& retryPending) {
+		bool changed = false;
+		retryPending = false;
+
+		std::vector<std::wstring> presentLower;
+		presentLower.reserve(presentPaths.size());
+		for (const auto& path : presentPaths) {
+			presentLower.push_back(ToLower(path));
+		}
+
+		for (auto& device : g_hidDevices) {
+			const auto deviceLower = ToLower(device.path);
+			const bool present = std::find(presentLower.begin(), presentLower.end(), deviceLower) != presentLower.end();
+			if (!present) {
+				if (device.isConnected || device.handle != INVALID_HANDLE_VALUE) {
+					DisconnectHidDevice(device);
+					changed = true;
+				}
+			} else if (device.handle == INVALID_HANDLE_VALUE) {
+				if (ReopenHidDevice(device)) {
+					changed = true;
+				} else {
+					retryPending = true;
+				}
+			}
+		}
+
+		for (size_t i = 0; i < presentPaths.size(); i++) {
+			bool known = false;
+			for (const auto& device : g_hidDevices) {
+				if (ToLower(device.path) == presentLower[i]) {
+					known = true;
+					break;
+				}
+			}
+			if (known) {
+				continue;
+			}
+			HidDevice device{};
+			if (!OpenHidDevice(presentPaths[i], true, device)) {
+				continue; // not a joystick-style device (or open failed)
+			}
+			device.deviceIndex = static_cast<int>(g_hidDevices.size());
+			g_hidDevices.push_back(std::move(device));
+			changed = true;
+		}
+
+		return changed;
+	}
+
 	void CopyDeviceInfo(const HidDevice& source, VpeInputDeviceInfo& destination) {
 		destination = {};
 		destination.deviceIndex = source.deviceIndex;
 		destination.axisCount = static_cast<int32_t>(source.axes.size());
-		destination.isConnected = 1;
+		destination.isConnected = source.isConnected ? 1 : 0;
 		CopyString(destination.stableId, VPE_INPUT_DEVICE_ID_SIZE, source.stableId);
 		CopyString(destination.displayName, VPE_INPUT_DEVICE_NAME_SIZE, source.displayName);
 	}
@@ -481,6 +620,11 @@ namespace {
 		const DWORD error = GetLastError();
 		if (error == ERROR_IO_PENDING) {
 			device.readPending = true;
+		} else {
+			// The device is gone (unplugged) or otherwise wedged; stop hammering
+			// the dead handle and let the hotplug reconciliation deal with it.
+			DisconnectHidDevice(device);
+			g_hotplugCheckRequested.store(true, std::memory_order_release);
 		}
 	}
 
@@ -497,6 +641,10 @@ namespace {
 		device.readPending = false;
 		if (ok && bytesRead > 0) {
 			ParseInputReport(device, timestampUsec, pendingEvents);
+		} else if (!ok) {
+			// Read completed with failure — typically device removal mid-read.
+			DisconnectHidDevice(device);
+			g_hotplugCheckRequested.store(true, std::memory_order_release);
 		}
 	}
 
@@ -515,13 +663,56 @@ namespace {
 		}
 	}
 
+	// Runs on the polling thread: cheap present-interface probe on a fixed
+	// cadence; the expensive reconciliation only runs when the probe result
+	// changed or a device read failed. Emits the devices-changed event outside
+	// the device mutex.
+	void CheckHotplug(int64_t timestampUsec, int64_t& nextCheckUsec, bool& reconcilePending) {
+		if (g_hotplugCheckRequested.exchange(false, std::memory_order_acq_rel)) {
+			// A read failure asked for reconciliation. React quickly but debounced,
+			// so a wedged device can't turn this into a per-tick reconcile loop.
+			reconcilePending = true;
+			const int64_t soonUsec = timestampUsec + 250000;
+			if (soonUsec < nextCheckUsec) {
+				nextCheckUsec = soonUsec;
+			}
+		}
+		if (timestampUsec < nextCheckUsec) {
+			return;
+		}
+		nextCheckUsec = timestampUsec + HotplugCheckIntervalUsec;
+
+		const std::wstring interfaceList = GetHidInterfaceList();
+		if (interfaceList.empty()) {
+			return; // probe failed; try again next cycle
+		}
+		if (!reconcilePending && interfaceList == g_lastHidInterfaceList) {
+			return;
+		}
+		g_lastHidInterfaceList = interfaceList;
+
+		bool changed;
+		bool retryPending;
+		{
+			std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
+			changed = ReconcileHidDevices(ParseInterfaceList(interfaceList), retryPending);
+		}
+		reconcilePending = retryPending;
+		if (changed) {
+			EmitDevicesChangedEvent(timestampUsec);
+		}
+	}
+
 	void PollingThreadFunc() {
 		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 
 		const HANDLE handles[2] = { g_timer, g_stopEvent };
 		std::vector<PendingAxisEvent> pendingAxisEvents;
+		int64_t nextHotplugCheckUsec = 0;
+		bool hotplugReconcilePending = false;
 		while (g_running.load(std::memory_order_acquire)) {
 			const int64_t timestampUsec = GetTimestampUsecInternal();
+			CheckHotplug(timestampUsec, nextHotplugCheckUsec, hotplugReconcilePending);
 			const bool isForeground = IsCurrentProcessForeground();
 			if (!isForeground) {
 				std::lock_guard<std::mutex> lock(g_bindingsMutex);
@@ -643,6 +834,9 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 		std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
 		EnumerateHidDevices(g_hidDevices, true);
 	}
+	// Baseline for the hotplug probe; the polling thread reconciles against this.
+	g_lastHidInterfaceList = GetHidInterfaceList();
+	g_hotplugCheckRequested.store(false, std::memory_order_release);
 	g_running.store(true, std::memory_order_release);
 
 	try {

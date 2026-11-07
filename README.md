@@ -65,7 +65,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make
 ```
 
-Requires: `libx11-dev`
+Requires `libx11-dev` and `libudev-dev`. The app user needs read access to the controller's input devices.
 
 ### macOS
 
@@ -77,7 +77,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 make
 ```
 
-Requires the AppKit, ApplicationServices, CoreFoundation, and IOKit frameworks provided by macOS.
+Requires CMake 3.24 or newer and the macOS SDK.
 
 ### CI / NuGet
 
@@ -135,7 +135,7 @@ NativeInputApi.VpeInputShutdown();
 
 NativeInput recognizes Open Pinball Device 1.x HID collections by their report signature on Windows, Linux, and macOS. The native input thread reads the reports and exposes named X/Y acceleration and velocity axes and the reported plunger fields. Preassigned OPD buttons that match existing VPE actions work alongside keyboard bindings, including physical tilt and digital nudges. An action stays pressed while any connected source holds it.
 
-Pinscape Pico can expose both OPD and a joystick. On Windows, VPE's cabinet setup prefers OPD and lets a player explicitly choose either collection. On Linux and macOS, OPD mapping identities include the physical USB port so identical boards can be mapped independently. Pico acceleration and velocity ranges depend on its firmware configuration.
+Pinscape Pico can expose both OPD and a joystick. VPE's cabinet setup prefers OPD and lets a player explicitly choose either collection. On Linux and macOS, OPD mapping identities include the physical USB port so identical boards can be mapped independently. Pico acceleration and velocity ranges depend on its firmware configuration.
 
 On Linux, run VPE with an X11 display. The local user needs read access to the Pico's hidraw node for input and read/write access to its USB device node for the signature request. On a systemd-based desktop, these udev rules grant the active local user access to a Pico using the default IDs. Save them as `/etc/udev/rules.d/70-pinscape-pico.rules`, reload the rules, and reconnect the board. Use the configured VID and PID if the firmware overrides them.
 
@@ -150,9 +150,15 @@ Build the report replay tests with `-DNATIVEINPUT_BUILD_TESTS=ON`, then run `cte
 
 | Platform | Status | API Used |
 |----------|--------|----------|
-| Windows  | Keyboard, HID joystick axes and Open Pinball Device | GetAsyncKeyState, QueryPerformanceCounter, Windows HID |
-| Linux    | Keyboard and Open Pinball Device | X11, hidraw, usbfs |
-| macOS    | Keyboard and Open Pinball Device | CoreGraphics, IOKit |
+| Windows  | Keyboard, joystick and gamepad axes, Open Pinball Device | GetAsyncKeyState, Windows HID, SDL |
+| Linux    | Keyboard, joystick and gamepad axes, Open Pinball Device | X11, SDL, hidraw, usbfs |
+| macOS    | Keyboard, joystick and gamepad axes, Open Pinball Device | CoreGraphics, SDL, IOKit |
+
+SDL is linked into the plugin and only its joystick and gamepad subsystem is started. The native polling thread samples all controller axes. Recognized gamepads expose named stick and trigger axes, and generic joysticks expose raw axes for manual nudge mapping. Windows keeps the existing HID axes and their saved IDs. If a Windows gamepad also exposes HID joystick axes, its standardized axes appear under the separate `(Gamepad)` entry.
+
+Some Nintendo controllers change their report format when SDL opens them. On Windows, use the standardized entry if a saved raw HID mapping for one of those controllers stops receiving samples.
+
+Controller mappings use serial numbers and physical paths where available. When the platform exposes identical devices without a physical identity, the mappings use slots for that model. Recheck those slots after changing the connection order of identical controllers.
 
 ## Performance
 
@@ -163,12 +169,13 @@ Build the report replay tests with `-DNATIVEINPUT_BUILD_TESTS=ON`, then run `cte
 
 ## Future Enhancements
 
-1. **Gamepad support**: XInput (Windows), SDL/libinput (Linux), GCController (macOS)
-2. **Analog inputs**: Generic HID joystick axes on macOS and Linux
-3. **Force feedback**: Haptics for nudge, tilt, button feedback
-4. **Configuration**: JSON-based key mapping files
-5. **Profiles**: Per-table input profiles
+1. **Controller buttons**: Configurable joystick, gamepad, and generic OPD button bindings
+2. **Force feedback**: Haptics for nudge, tilt, button feedback
+3. **Configuration**: JSON-based key mapping files
+4. **Profiles**: Per-table input profiles
 
 ## License
 
 GPLv3+ (same as VPE)
+
+SDL is distributed under the [zlib license](native/nuget/SDL-LICENSE.txt).

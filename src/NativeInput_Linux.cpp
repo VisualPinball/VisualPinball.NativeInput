@@ -3,6 +3,7 @@
 
 #ifdef __linux__
 
+#include "ControllerInput.h"
 #include "OpenPinballInput.h"
 
 #include <X11/Xatom.h>
@@ -34,6 +35,7 @@ namespace {
 	std::condition_variable g_waitCondition;
 	std::mutex g_waitMutex;
 	OpenPinballDevice::Input g_input;
+	ControllerInput g_controllers;
 	std::mutex g_bindingsMutex;
 	int g_pollIntervalUs = 500;
 	Clock::time_point g_startTime;
@@ -247,9 +249,10 @@ namespace {
 		return (keyBits[index] & (1u << bit)) != 0;
 	}
 
-	void PollingThreadFunc() {
+	void PollingThreadFunc(VpeInputEventCallback callback, void* userData) {
 		VpeSetThreadPriority();
 		OpenPinballDevice::Transport transport(g_input);
+		g_controllers.Start();
 		while (g_running.load(std::memory_order_acquire)) {
 			const int64_t timestamp = GetTimestampUsecInternal();
 			OpenPinballDevice::Keys keys{};
@@ -268,11 +271,13 @@ namespace {
 			}
 			g_input.BeginPoll(timestamp, foreground, keys);
 			transport.Poll(timestamp);
+			g_controllers.Poll(timestamp, foreground, callback, userData);
 
 			std::unique_lock<std::mutex> lock(g_waitMutex);
 			g_waitCondition.wait_for(lock, std::chrono::microseconds(g_pollIntervalUs),
 				[] { return !g_running.load(std::memory_order_acquire); });
 		}
+		g_controllers.Stop();
 	}
 }
 
@@ -281,6 +286,7 @@ extern "C" {
 VPE_API int VpeInputInit(void) {
 	g_protocolVersionChecked.store(false, std::memory_order_release);
 	g_input.ResetGameplayGate();
+	g_controllers.SetGameplayEnabled(true);
 	g_startTime = Clock::now();
 	g_display = XOpenDisplay(nullptr);
 	if (g_display == nullptr) {
@@ -341,6 +347,7 @@ VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count) {
 
 VPE_API void VpeInputSetGameplayInputEnabled(int enabled) {
 	g_input.SetGameplayEnabled(enabled);
+	g_controllers.SetGameplayEnabled(enabled != 0);
 }
 
 VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData, int pollIntervalUs) {
@@ -355,7 +362,7 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 	g_running.store(true, std::memory_order_release);
 
 	try {
-		g_pollingThread = std::thread(PollingThreadFunc);
+		g_pollingThread = std::thread(PollingThreadFunc, callback, userData);
 		return 1;
 	} catch (...) {
 		g_running.store(false, std::memory_order_release);
@@ -377,11 +384,14 @@ VPE_API void VpeInputStopPolling(void) {
 }
 
 VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
-	return g_input.ListDevices(devices, maxDevices);
+	const int count = g_input.ListDevices(devices, maxDevices);
+	return g_controllers.AppendDevices(devices, maxDevices, count);
 }
 
 VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes) {
-	return g_input.ListAxes(deviceIndex, axes, maxAxes);
+	return deviceIndex >= ControllerInput::FirstDeviceIndex
+		? g_controllers.ListAxes(deviceIndex, axes, maxAxes)
+		: g_input.ListAxes(deviceIndex, axes, maxAxes);
 }
 
 VPE_API int64_t VpeGetTimestampUsec(void) {

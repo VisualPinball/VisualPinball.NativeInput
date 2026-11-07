@@ -81,7 +81,7 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libx11-dev
+          sudo apt-get install -y libx11-dev libudev-dev
 
       - name: Build native library
         run: |

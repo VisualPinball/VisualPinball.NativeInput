@@ -46,12 +46,13 @@ struct Observed {
 	}
 };
 
-static SDL_JoystickID Attach(const char* name, SDL_JoystickType type, Uint16 axes) {
+static SDL_JoystickID Attach(const char* name, SDL_JoystickType type, Uint16 axes, Uint16 hats = 0) {
 	SDL_VirtualJoystickDesc desc;
 	SDL_INIT_INTERFACE(&desc);
 	desc.name = name;
 	desc.type = type;
 	desc.naxes = axes;
+	desc.nhats = hats;
 	desc.nbuttons = 1;
 	const auto id = SDL_AttachVirtualJoystick(&desc);
 	Check(id != 0, "Attach a virtual controller");
@@ -68,7 +69,7 @@ int main() {
 		if (event->eventType == VPE_INPUT_EVENT_DEVICES_CHANGED) state.Snapshot();
 	};
 
-	const auto rawId = Attach("PinscapePico", SDL_JOYSTICK_TYPE_UNKNOWN, 6);
+	const auto rawId = Attach("PinscapePico", SDL_JOYSTICK_TYPE_UNKNOWN, 6, 1);
 	const auto padId = Attach("VPE Test Pad", SDL_JOYSTICK_TYPE_GAMEPAD, SDL_GAMEPAD_AXIS_COUNT);
 	SDL_Joystick* raw = SDL_OpenJoystick(rawId);
 	SDL_Joystick* pad = SDL_OpenJoystick(padId);
@@ -87,10 +88,12 @@ int main() {
 	input.ListAxes(gamepad.deviceIndex, axes.data(), static_cast<int>(axes.size()));
 	Check(axes[0].usagePage == VPE_GAMEPAD_AXIS_USAGE_PAGE && std::strcmp(axes[0].name, "Left Stick X") == 0,
 		"Expose standardized axis metadata");
-	VpeInputButtonInfo rawButton{};
+	std::array<VpeInputButtonInfo, 5> rawButtons{};
 	VpeInputButtonInfo padButton{};
-	Check(VpeInputListDeviceButtons(pinscape.deviceIndex, &rawButton, 1) == 1 && rawButton.buttonId == 0,
-		"Expose raw joystick buttons");
+	Check(VpeInputListDeviceButtons(pinscape.deviceIndex, rawButtons.data(), 5) == 5 && rawButtons[0].buttonId == 0
+		&& std::strcmp(rawButtons[1].name, "Hat 1 Up") == 0 && std::strcmp(rawButtons[2].name, "Hat 1 Right") == 0,
+		"Expose raw joystick buttons and POV directions");
+	const auto rawButton = rawButtons[0];
 	Check(VpeInputListDeviceButtons(gamepad.deviceIndex, &padButton, 1) == 1
 		&& padButton.buttonId == SDL_GAMEPAD_BUTTON_SOUTH, "Expose standardized gamepad buttons");
 	VpeInputButtonBinding bindings[] = {{VPE_INPUT_LEFT_NUDGE, rawButton.buttonId}, {VPE_INPUT_LEFT_NUDGE, padButton.buttonId}};
@@ -124,6 +127,57 @@ int main() {
 	input.Poll(4000, true, callback, &observed);
 	Check(observed.SawAxis(gamepad.deviceIndex, 0, -.5f), "Refresh held axes on resume");
 
+	const auto makeBinding = [](int action, int group, int kind, int id, float threshold, const char* device) {
+		VpeInputControlBinding binding{action, group, kind, id, threshold, {}};
+		std::snprintf(binding.deviceId, sizeof(binding.deviceId), "%s", device);
+		return binding;
+	};
+	const auto hatUp = makeBinding(VPE_INPUT_LEFT_NUDGE, 0, VPE_CONTROL_BUTTON, rawButtons[1].buttonId, 0, pinscape.stableId);
+	const VpeInputControlBinding controls[] = {
+		hatUp,
+		makeBinding(VPE_INPUT_LEFT_NUDGE, 1, VPE_CONTROL_AXIS_BELOW, 0, -.75f, gamepad.stableId),
+		makeBinding(VPE_INPUT_SLAM_TILT, 0, VPE_CONTROL_BUTTON, rawButtons[1].buttonId, 0, pinscape.stableId),
+		makeBinding(VPE_INPUT_SLAM_TILT, 0, VPE_CONTROL_AXIS_ABOVE, 0, .5f, gamepad.stableId),
+	};
+	VpeInputSetControlBindings(controls, 4);
+	Check(SDL_SetJoystickVirtualAxis(pad, 0, 24576) && SDL_SetJoystickVirtualHat(raw, 0, SDL_HAT_RIGHTUP),
+		"Inject a stick and diagonal POV combination");
+	input.Poll(4100, true, callback, &observed);
+	const uint64_t slam = uint64_t{1} << VPE_INPUT_SLAM_TILT;
+	Check(NativeButtons::GetState().PressedActions() == slam, "The complete combo suppresses its newly pressed subset");
+	VpeInputListDeviceButtons(pinscape.deviceIndex, rawButtons.data(), 5);
+	Check(rawButtons[1].isPressed && rawButtons[2].isPressed, "A diagonal holds both cardinal directions");
+	Check(SDL_SetJoystickVirtualAxis(pad, 0, 14746), "Dither just below the positive press threshold");
+	input.Poll(4150, true, callback, &observed);
+	Check(NativeButtons::GetState().PressedActions() == slam, "Threshold hysteresis keeps the combo pressed during jitter");
+	Check(SDL_SetJoystickVirtualAxis(pad, 0, -24576), "Move the axis to the alternative threshold");
+	input.Poll(4200, true, callback, &observed);
+	Check(NativeButtons::GetState().PressedActions() == nudge, "The negative axis threshold is an independent alternative");
+	Check(SDL_SetJoystickVirtualAxis(pad, 0, 0), "Release the axis");
+	input.Poll(4300, true, callback, &observed);
+	Check(NativeButtons::GetState().PressedActions() == 0, "Releasing the combo does not replay its held subset");
+
+	input.SetGameplayEnabled(false);
+	VpeInputStartControlCapture(2);
+	Check(SDL_SetJoystickVirtualButton(pad, 0, true), "Press a fresh button for capture");
+	input.Poll(4400, true, callback, &observed);
+	Check(SDL_SetJoystickVirtualAxis(pad, 0, 24576), "Move a stick while the button is held");
+	input.Poll(4500, true, callback, &observed);
+	Check(SDL_SetJoystickVirtualButton(pad, 0, false) && SDL_SetJoystickVirtualAxis(pad, 0, 19661),
+		"Release the button while the stick still sits inside the capture hysteresis");
+	input.Poll(4600, true, callback, &observed);
+	VpeInputControlBinding captured[8]{};
+	Check(VpeInputReadControlCapture(captured, 8) == 0, "Wait for the captured axis to release through its deadband");
+	Check(SDL_SetJoystickVirtualAxis(pad, 0, 0), "Release the stick");
+	input.Poll(4700, true, callback, &observed);
+	Check(VpeInputReadControlCapture(captured, 8) == 2 && captured[0].controlId == padButton.buttonId
+		&& captured[0].kind == VPE_CONTROL_BUTTON && captured[1].kind == VPE_CONTROL_AXIS_ABOVE
+		&& std::strcmp(captured[0].deviceId, gamepad.stableId) == 0,
+		"Capture the overlapping inputs during pause and ignore the hat held before capture");
+	VpeInputStartControlCapture(0);
+	input.SetGameplayEnabled(true);
+	VpeInputSetButtonBindings(bindings, 2);
+
 	const std::string rawStableId = pinscape.stableId;
 	Check(SDL_DetachVirtualJoystick(rawId), "Unplug the raw joystick");
 	SDL_CloseJoystick(raw);
@@ -132,7 +186,7 @@ int main() {
 	Check(input.ListAxes(pinscape.deviceIndex, nullptr, 0) == 0, "Remove the disconnected axis snapshot");
 	Check(VpeInputListDeviceButtons(pinscape.deviceIndex, nullptr, 0) == 0
 		&& NativeButtons::GetState().PressedActions() == 0, "Drop the held button when the joystick disconnects");
-	const auto newRawId = Attach("PinscapePico", SDL_JOYSTICK_TYPE_UNKNOWN, 6);
+	const auto newRawId = Attach("PinscapePico", SDL_JOYSTICK_TYPE_UNKNOWN, 6, 1);
 	input.Poll(260000, true, callback, &observed);
 	const auto replacement = observed.Find("PinscapePico");
 	Check(replacement.isConnected && replacement.deviceIndex != pinscape.deviceIndex

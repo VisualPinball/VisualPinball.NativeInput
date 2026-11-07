@@ -43,9 +43,11 @@ namespace OpenPinballDevice {
 		std::snprintf(device.info.displayName, sizeof(device.info.displayName), "%.*s (OPD)",
 			static_cast<int>(sizeof(device.info.displayName) - sizeof(" (OPD)")), product.c_str());
 
+		std::vector<int> axisIds;
 		for (const auto& axis : Axes) {
 			if (axis.offset + 2 > descriptor.payloadSize) break;
 			auto& info = device.axes[device.info.axisCount++];
+			axisIds.push_back(axis.id);
 			info.axisId = axis.id;
 			info.usagePage = UsagePage;
 			info.usage = Usage;
@@ -55,7 +57,7 @@ namespace OpenPinballDevice {
 
 		{
 			std::lock_guard<std::mutex> lock(m_snapshotMutex);
-			NativeButtons::GetState().Connect(device.info.deviceIndex, stableId, NativeButtons::OpdGenericButtons());
+			NativeButtons::GetState().Connect(device.info.deviceIndex, stableId, NativeButtons::OpdGenericButtons(), axisIds);
 			m_devices.push_back(device);
 		}
 		Emit({timestamp, VPE_INPUT_EVENT_DEVICES_CHANGED});
@@ -95,8 +97,14 @@ namespace OpenPinballDevice {
 				: Report::ReadPayload(bytes, size, report);
 			if (!valid) return;
 
-			const bool genericChanged = NativeButtons::UpdateOpdGenericButtons(deviceIndex, report.GenericButtons());
-			buttonsChanged = genericChanged || device->buttons != report.PinballButtons();
+			const auto genericMask = report.GenericButtons();
+			const bool controlsChanged = NativeButtons::GetState().Update(deviceIndex, [&](const auto& button) {
+				return (genericMask & (uint32_t{1} << button.buttonId)) != 0;
+			}, [&](int axisId, float previous) {
+				float value;
+				return report.TryReadAxis(Axes[axisId], value) ? value : previous;
+			});
+			buttonsChanged = controlsChanged || device->buttons != report.PinballButtons();
 			device->buttons = report.PinballButtons();
 			int64_t sample;
 			if (device->clock.Translate(report.Timestamp(), timestamp, sample)) {
@@ -108,7 +116,7 @@ namespace OpenPinballDevice {
 				}
 			}
 		}
-		// A duplicate motion timestamp can still carry a new button level.
+		// Controls use every report, including repeated motion timestamps.
 		if (buttonsChanged) PublishActions(timestamp);
 		if (m_foreground) {
 			for (int i = 0; i < eventCount; ++i) Emit(events[i]);

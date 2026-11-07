@@ -4,6 +4,7 @@
 #ifdef _WIN32
 
 #include "NativeInput.h"
+#include "OpenPinballDevice.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -20,6 +21,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <deque>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <string>
@@ -34,10 +37,12 @@ namespace {
 	constexpr USAGE UsageAxisMin = 0x30;
 	constexpr USAGE UsageAxisMax = 0x38;
 
-	struct KeyBindingState {
-		int keyCode;
+	struct ActionBindingState {
 		VpeInputAction action;
-		float previousValue;
+		std::vector<int> keys;
+		uint32_t opdMask = 0;
+		bool keyPressed = false;
+		OpenPinballDevice::ActionLatch latch;
 	};
 
 	struct AxisDescriptor {
@@ -48,6 +53,7 @@ namespace {
 		float previousValue;
 		float rawValue;
 		int64_t timestampUsec;
+		const OpenPinballDevice::Axis* opdAxis = nullptr;
 	};
 
 	struct HidDevice {
@@ -64,12 +70,22 @@ namespace {
 		HANDLE readEvent = NULL;
 		bool readPending = false;
 		bool isConnected = true;
+		bool isOpd = false;
+		uint8_t opdReportId = 0;
+		uint32_t opdButtons = 0;
+		OpenPinballDevice::Clock opdClock;
 	};
 
 	struct PendingAxisEvent {
+		int64_t timestampUsec;
 		int deviceIndex;
 		int axisId;
 		float value;
+	};
+
+	struct PendingButtons {
+		int64_t timestampUsec;
+		uint32_t mask;
 	};
 
 	std::thread g_pollingThread;
@@ -81,10 +97,13 @@ namespace {
 	HANDLE g_timer = NULL;
 	HANDLE g_stopEvent = NULL;
 
-	std::mutex g_bindingsMutex; // guards g_bindings and g_wasForeground between API calls and the polling thread
-	std::vector<KeyBindingState> g_bindings;
+	std::mutex g_bindingsMutex;
+	std::vector<ActionBindingState> g_bindings;
+	bool g_gameplayInputEnabled = true;
+	bool g_gameplayGateConfigured = false;
 	std::mutex g_hidDevicesMutex; // guards the live polling device snapshot and axis telemetry
-	std::vector<HidDevice> g_hidDevices;
+	// ReadFile retains each OVERLAPPED address until completion or cancellation.
+	std::deque<HidDevice> g_hidDevices;
 
 	// Hotplug handling (polling thread only, except the atomic request flag):
 	// a cheap present-interface probe runs every couple of seconds, and a full
@@ -95,7 +114,6 @@ namespace {
 
 	LARGE_INTEGER g_frequency;
 	LARGE_INTEGER g_startTime;
-	bool g_wasForeground = false;
 
 	int64_t GetTimestampUsecInternal() {
 		if (g_frequency.QuadPart == 0) {
@@ -205,14 +223,27 @@ namespace {
 		g_callback(&event, g_userData);
 	}
 
-	void EmitReleaseForPressedKeys(int64_t timestampUsec) {
+	ActionBindingState& GetBinding(VpeInputAction action) {
 		for (auto& binding : g_bindings) {
-			if (binding.previousValue <= 0.0f) {
-				continue;
-			}
+			if (binding.action == action) return binding;
+		}
+		g_bindings.push_back({action});
+		return g_bindings.back();
+	}
 
-			binding.previousValue = 0.0f;
-			EmitActionEvent(timestampUsec, binding.action, 0.0f);
+	void AddOpdBindings() {
+		for (size_t bit = 0; bit < std::size(OpenPinballDevice::ButtonActions); ++bit) {
+			GetBinding(OpenPinballDevice::ButtonActions[bit]).opdMask |= uint32_t{1} << bit;
+		}
+	}
+
+	void PublishActions(int64_t timestampUsec, bool enabled, uint32_t opdButtons) {
+		for (auto& binding : g_bindings) {
+			const bool pressed = binding.keyPressed || (binding.opdMask & opdButtons) != 0;
+			bool value;
+			if (binding.latch.Update(pressed, enabled, value)) {
+				EmitActionEvent(timestampUsec, binding.action, value ? 1.0f : 0.0f);
+			}
 		}
 	}
 
@@ -303,7 +334,7 @@ namespace {
 		}
 	}
 
-	void CloseHidDevices(std::vector<HidDevice>& devices) {
+	void CloseHidDevices(std::deque<HidDevice>& devices) {
 		for (auto& device : devices) {
 			CloseHidDevice(device);
 		}
@@ -357,6 +388,44 @@ namespace {
 			offset = (end == std::wstring::npos) ? multiSz.size() : end + 1;
 		}
 		return paths;
+	}
+
+	bool OpenOpdCollection(HidDevice& device) {
+		const auto& caps = device.caps;
+		if (caps.UsagePage != OpenPinballDevice::UsagePage || caps.Usage != OpenPinballDevice::Usage
+			|| caps.NumberInputButtonCaps != 1 || caps.NumberInputValueCaps != 0
+			|| caps.InputReportByteLength < OpenPinballDevice::ReportIdSize + 16) {
+			return false;
+		}
+
+		// Windows exposes OPD's opaque HID array as a button capability. The
+		// indexed usage string is the protocol signature, independent of VID/PID.
+		HIDP_BUTTON_CAPS field{};
+		USHORT count = 1;
+		if (HidP_GetButtonCaps(HidP_Input, &field, &count, device.preparsedData) != HIDP_STATUS_SUCCESS
+			|| count != 1 || field.UsagePage != caps.UsagePage) {
+			return false;
+		}
+		const auto usage = field.IsRange ? field.Range.UsageMin : field.NotRange.Usage;
+		const auto stringIndex = field.IsRange ? field.Range.StringMin : field.NotRange.StringIndex;
+		if (usage != 0 || (field.IsRange && field.Range.UsageMax != 0) || field.IsStringRange || stringIndex == 0) return false;
+
+		wchar_t signature[128] = {};
+		if (!HidD_GetIndexedString(device.handle, stringIndex, signature, sizeof(signature))
+			|| !OpenPinballDevice::SupportsVersion(std::wstring_view(signature, std::find(std::begin(signature), std::end(signature), L'\0') - signature))) {
+			return false;
+		}
+
+		device.isOpd = true;
+		device.opdReportId = field.ReportID;
+		device.displayName += " (OPD)";
+		for (const auto& axis : OpenPinballDevice::Axes) {
+			if (axis.offset + 2 + OpenPinballDevice::ReportIdSize <= caps.InputReportByteLength) {
+				device.axes.push_back({axis.id, caps.UsagePage, caps.Usage, {},
+					std::numeric_limits<float>::quiet_NaN(), 0.0f, 0, &axis});
+			}
+		}
+		return true;
 	}
 
 	bool OpenHidDevice(const std::wstring& path, bool overlapped, HidDevice& device) {
@@ -414,17 +483,20 @@ namespace {
 			}
 		}
 
-		if (!DeviceLooksLikeJoystick(device.caps)) {
+		if (!DeviceLooksLikeJoystick(device.caps) && !OpenOpdCollection(device)) {
 			CloseHidDevice(device);
 			return false;
 		}
-		if (device.axes.empty() || device.caps.InputReportByteLength == 0) {
+		if ((!device.isOpd && device.axes.empty()) || device.caps.InputReportByteLength == 0) {
 			CloseHidDevice(device);
 			return false;
 		}
 
 		device.inputReport.resize(device.caps.InputReportByteLength);
 		if (overlapped) {
+			// Motion reports contain current levels. Keep the driver queue short
+			// so a scheduling stall doesn't turn into a burst of old nudges.
+			if (device.isOpd) HidD_SetNumInputBuffers(device.handle, 4);
 			device.readEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 			if (device.readEvent == NULL) {
 				CloseHidDevice(device);
@@ -435,7 +507,7 @@ namespace {
 		return true;
 	}
 
-	void EnumerateHidDevices(std::vector<HidDevice>& devices, bool openForPolling) {
+	void EnumerateHidDevices(std::deque<HidDevice>& devices, bool openForPolling) {
 		CloseHidDevices(devices);
 
 		GUID hidGuid;
@@ -535,7 +607,7 @@ namespace {
 			}
 			HidDevice device{};
 			if (!OpenHidDevice(presentPaths[i], true, device)) {
-				continue; // not a joystick-style device (or open failed)
+				continue;
 			}
 			device.deviceIndex = static_cast<int>(g_hidDevices.size());
 			g_hidDevices.push_back(std::move(device));
@@ -559,14 +631,48 @@ namespace {
 		destination.axisId = source.axisId;
 		destination.usagePage = source.usagePage;
 		destination.usage = source.usage;
-		destination.kind = VPE_AXIS_KIND_POSITION;
+		destination.kind = source.opdAxis ? source.opdAxis->kind : VPE_AXIS_KIND_POSITION;
 		destination.rawValue = source.rawValue;
 		destination.timestampUsec = source.timestampUsec;
-		CopyString(destination.name, VPE_INPUT_AXIS_NAME_SIZE, AxisName(source.usage));
+		CopyString(destination.name, VPE_INPUT_AXIS_NAME_SIZE, source.opdAxis ? source.opdAxis->name : AxisName(source.usage));
 	}
 
-	void ParseInputReport(HidDevice& device, int64_t timestampUsec, std::vector<PendingAxisEvent>& pendingEvents) {
-		if (device.preparsedData == nullptr || device.inputReport.empty()) {
+	// Called with the HID snapshot locked. Aggregate by protocol bit so a
+	// second controller holding the same button keeps the action pressed.
+	void CaptureOpdButtons(int64_t timestampUsec, std::vector<PendingButtons>& changes) {
+		uint32_t buttons = 0;
+		for (const auto& device : g_hidDevices) {
+			if (device.isOpd && device.isConnected) buttons |= device.opdButtons;
+		}
+		if (changes.empty() || changes.back().mask != buttons) changes.push_back({timestampUsec, buttons});
+	}
+
+	void ParseInputReport(HidDevice& device, DWORD bytesRead, int64_t timestampUsec,
+		std::vector<PendingAxisEvent>& pendingEvents, std::vector<PendingButtons>& buttons) {
+		if (device.preparsedData == nullptr || bytesRead != device.inputReport.size()) {
+			return;
+		}
+		if (device.isOpd) {
+			OpenPinballDevice::Report report{};
+			if (!OpenPinballDevice::Report::Read(device.inputReport.data(), bytesRead, device.opdReportId, report)) {
+				return;
+			}
+			// Button levels are authoritative even if a firmware repeats its clock.
+			const auto buttonMask = report.PinballButtons();
+			if (device.opdButtons != buttonMask) {
+				device.opdButtons = buttonMask;
+				CaptureOpdButtons(timestampUsec, buttons);
+			}
+			int64_t sampleUsec;
+			if (!device.opdClock.Translate(report.Timestamp(), timestampUsec, sampleUsec)) return;
+			for (auto& axis : device.axes) {
+				float value;
+				if (report.TryReadAxis(*axis.opdAxis, value)) {
+					axis.rawValue = value;
+					axis.timestampUsec = sampleUsec;
+					pendingEvents.push_back({sampleUsec, device.deviceIndex, axis.axisId, value});
+				}
+			}
 			return;
 		}
 
@@ -595,12 +701,13 @@ namespace {
 			axis.timestampUsec = timestampUsec;
 			if (std::isnan(axis.previousValue) || std::fabs(normalized - axis.previousValue) > 0.0001f) {
 				axis.previousValue = normalized;
-				pendingEvents.push_back({ device.deviceIndex, axis.axisId, normalized });
+				pendingEvents.push_back({timestampUsec, device.deviceIndex, axis.axisId, normalized});
 			}
 		}
 	}
 
-	void StartHidRead(HidDevice& device, int64_t timestampUsec, std::vector<PendingAxisEvent>& pendingEvents) {
+	void StartHidRead(HidDevice& device, int64_t timestampUsec,
+		std::vector<PendingAxisEvent>& pendingEvents, std::vector<PendingButtons>& buttons) {
 		if (device.handle == INVALID_HANDLE_VALUE || device.readPending || device.inputReport.empty()) {
 			return;
 		}
@@ -614,7 +721,7 @@ namespace {
 			&bytesRead,
 			&device.readOverlap);
 		if (ok) {
-			ParseInputReport(device, timestampUsec, pendingEvents);
+			ParseInputReport(device, bytesRead, timestampUsec, pendingEvents, buttons);
 			return;
 		}
 
@@ -629,7 +736,8 @@ namespace {
 		}
 	}
 
-	void CompleteHidRead(HidDevice& device, int64_t timestampUsec, std::vector<PendingAxisEvent>& pendingEvents) {
+	void CompleteHidRead(HidDevice& device, int64_t timestampUsec,
+		std::vector<PendingAxisEvent>& pendingEvents, std::vector<PendingButtons>& buttons) {
 		if (!device.readPending || device.readEvent == NULL) {
 			return;
 		}
@@ -641,7 +749,7 @@ namespace {
 		const BOOL ok = GetOverlappedResult(device.handle, &device.readOverlap, &bytesRead, FALSE);
 		device.readPending = false;
 		if (ok && bytesRead > 0) {
-			ParseInputReport(device, timestampUsec, pendingEvents);
+			ParseInputReport(device, bytesRead, timestampUsec, pendingEvents, buttons);
 		} else if (!ok) {
 			// Read completed with failure — typically device removal mid-read.
 			DisconnectHidDevice(device);
@@ -649,19 +757,31 @@ namespace {
 		}
 	}
 
-	void PollHidDevices(int64_t timestampUsec, std::vector<PendingAxisEvent>& pendingEvents) {
+	bool PollHidDevices(int64_t timestampUsec, bool foreground, std::vector<PendingAxisEvent>& pendingEvents,
+		std::vector<PendingButtons>& buttons) {
 		pendingEvents.clear();
+		buttons.clear();
+		bool disconnected = false;
 		{
 			std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
+			CaptureOpdButtons(timestampUsec, buttons);
 			for (auto& device : g_hidDevices) {
-				CompleteHidRead(device, timestampUsec, pendingEvents);
-				StartHidRead(device, timestampUsec, pendingEvents);
+				// Keep draining OPD in the background so buffered motion and
+				// button edges aren't replayed on returning to the game.
+				if (!foreground && !device.isOpd) continue;
+				const bool wasConnected = device.isConnected;
+				const size_t firstEvent = pendingEvents.size();
+				CompleteHidRead(device, timestampUsec, pendingEvents, buttons);
+				StartHidRead(device, timestampUsec, pendingEvents, buttons);
+				if (wasConnected && !device.isConnected) {
+					disconnected = true;
+					pendingEvents.resize(firstEvent);
+					CaptureOpdButtons(timestampUsec, buttons);
+				}
 			}
 		}
 
-		for (const auto& event : pendingEvents) {
-			EmitAxisEvent(timestampUsec, event.deviceIndex, event.axisId, event.value);
-		}
+		return disconnected;
 	}
 
 	// Runs on the polling thread: cheap present-interface probe on a fixed
@@ -709,36 +829,35 @@ namespace {
 
 		const HANDLE handles[2] = { g_timer, g_stopEvent };
 		std::vector<PendingAxisEvent> pendingAxisEvents;
+		std::vector<PendingButtons> pendingButtons;
 		int64_t nextHotplugCheckUsec = 0;
 		bool hotplugReconcilePending = false;
 		while (g_running.load(std::memory_order_acquire)) {
 			const int64_t timestampUsec = GetTimestampUsecInternal();
 			CheckHotplug(timestampUsec, nextHotplugCheckUsec, hotplugReconcilePending);
 			const bool isForeground = IsCurrentProcessForeground();
-			if (!isForeground) {
+			const bool disconnected = PollHidDevices(timestampUsec, isForeground, pendingAxisEvents, pendingButtons);
+			{
 				std::lock_guard<std::mutex> lock(g_bindingsMutex);
-				if (g_wasForeground) {
-					EmitReleaseForPressedKeys(timestampUsec);
+				for (auto& binding : g_bindings) {
+					binding.keyPressed = isForeground && std::any_of(binding.keys.begin(), binding.keys.end(), [](int key) {
+						return (GetAsyncKeyState(key) & 0x8000) != 0;
+					});
 				}
-				g_wasForeground = false;
-			} else {
-				{
-					std::lock_guard<std::mutex> lock(g_bindingsMutex);
-					g_wasForeground = true;
-
-					for (auto& binding : g_bindings) {
-						SHORT keyState = GetAsyncKeyState(binding.keyCode);
-						bool isPressed = (keyState & 0x8000) != 0;
-						float currentValue = isPressed ? 1.0f : 0.0f;
-
-						if (currentValue != binding.previousValue) {
-							binding.previousValue = currentValue;
-							EmitActionEvent(timestampUsec, binding.action, currentValue);
-						}
+				if (!isForeground && !g_gameplayGateConfigured) {
+					// Preserve focus-loss releases for clients predating the optional gate.
+					PublishActions(timestampUsec, true, 0);
+				} else {
+					for (const auto& state : pendingButtons) {
+						PublishActions(state.timestampUsec, isForeground && g_gameplayInputEnabled, state.mask);
 					}
 				}
-
-				PollHidDevices(timestampUsec, pendingAxisEvents);
+			}
+			if (disconnected) EmitDevicesChangedEvent(timestampUsec);
+			if (isForeground) {
+				for (const auto& event : pendingAxisEvents) {
+					EmitAxisEvent(event.timestampUsec, event.deviceIndex, event.axisId, event.value);
+				}
 			}
 
 			if (g_pollIntervalUs > 0 && g_timer != NULL) {
@@ -792,6 +911,8 @@ VPE_API void VpeInputShutdown(void) {
 	{
 		std::lock_guard<std::mutex> lock(g_bindingsMutex);
 		g_bindings.clear();
+		g_gameplayInputEnabled = true;
+		g_gameplayGateConfigured = false;
 	}
 	{
 		std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
@@ -810,17 +931,19 @@ VPE_API void VpeInputShutdown(void) {
 VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count) {
 	std::lock_guard<std::mutex> lock(g_bindingsMutex);
 	g_bindings.clear();
-	g_wasForeground = false;
 
 	for (int i = 0; i < count; i++) {
 		if (bindings[i].bindingType == VPE_BINDING_KEYBOARD) {
-			g_bindings.push_back({
-				bindings[i].keyCode,
-				static_cast<VpeInputAction>(bindings[i].action),
-				0.0f,
-			});
+			GetBinding(static_cast<VpeInputAction>(bindings[i].action)).keys.push_back(bindings[i].keyCode);
 		}
 	}
+	AddOpdBindings();
+}
+
+VPE_API void VpeInputSetGameplayInputEnabled(int enabled) {
+	std::lock_guard<std::mutex> lock(g_bindingsMutex);
+	g_gameplayGateConfigured = true;
+	g_gameplayInputEnabled = enabled != 0;
 }
 
 VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData, int pollIntervalUs) {
@@ -831,7 +954,13 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 	g_callback = callback;
 	g_userData = userData;
 	g_pollIntervalUs = pollIntervalUs;
-	g_wasForeground = false;
+	{
+		std::lock_guard<std::mutex> lock(g_bindingsMutex);
+		AddOpdBindings();
+		for (auto& binding : g_bindings) {
+			binding.latch = {};
+		}
+	}
 	if (g_stopEvent != NULL) {
 		ResetEvent(g_stopEvent);
 	}
@@ -839,8 +968,8 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 		std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
 		EnumerateHidDevices(g_hidDevices, true);
 	}
-	// Baseline for the hotplug probe; the polling thread reconciles against this.
-	g_lastHidInterfaceList = GetHidInterfaceList();
+	// Reconcile on the first poll too, in case a device appeared during enumeration.
+	g_lastHidInterfaceList.clear();
 	g_hotplugCheckRequested.store(false, std::memory_order_release);
 	g_running.store(true, std::memory_order_release);
 
@@ -889,7 +1018,7 @@ VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
 		return count;
 	}
 
-	std::vector<HidDevice> enumeratedDevices;
+	std::deque<HidDevice> enumeratedDevices;
 	EnumerateHidDevices(enumeratedDevices, false);
 	const int count = static_cast<int>(enumeratedDevices.size());
 	if (devices != nullptr && maxDevices > 0) {
@@ -919,7 +1048,7 @@ VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int 
 		return count;
 	}
 
-	std::vector<HidDevice> enumeratedDevices;
+	std::deque<HidDevice> enumeratedDevices;
 	EnumerateHidDevices(enumeratedDevices, false);
 	if (deviceIndex < 0 || deviceIndex >= static_cast<int>(enumeratedDevices.size())) {
 		CloseHidDevices(enumeratedDevices);

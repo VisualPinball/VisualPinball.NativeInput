@@ -208,6 +208,22 @@ typedef struct {
 	char deviceId[VPE_INPUT_DEVICE_ID_SIZE]; // UTF-8 stable ID from VpeInputListDevices
 } VpeInputButtonBinding;
 
+typedef enum {
+	VPE_CONTROL_BUTTON = 0,
+	VPE_CONTROL_AXIS_ABOVE = 1,
+	VPE_CONTROL_AXIS_BELOW = 2
+} VpeInputControlKind;
+
+// Rows sharing an action and group form a combo. Groups are alternatives.
+typedef struct {
+	int32_t action;
+	int32_t group;
+	int32_t kind;
+	int32_t controlId;
+	float threshold;
+	char deviceId[VPE_INPUT_DEVICE_ID_SIZE];
+} VpeInputControlBinding;
+
 // Callback for input events
 typedef void (*VpeInputEventCallback)(const VpeInputEvent* event, void* userData);
 
@@ -255,6 +271,11 @@ VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int 
 // predefined OPD mappings. Replace them atomically, even while polling.
 VPE_API void VpeInputSetButtonBindings(const VpeInputButtonBinding* bindings, int count);
 VPE_API int VpeInputListDeviceButtons(int deviceIndex, VpeInputButtonInfo* buttons, int maxButtons);
+VPE_API void VpeInputSetControlBindings(const VpeInputControlBinding* controls, int count);
+// 0 cancels, 1 captures a single control, 2 captures controls held together.
+VPE_API void VpeInputStartControlCapture(int mode);
+// Returns the completed combo's size once all its controls have been released.
+VPE_API int VpeInputReadControlCapture(VpeInputControlBinding* controls, int maxControls);
 
 // Get high-resolution timestamp in microseconds
 VPE_API int64_t VpeGetTimestampUsec(void);

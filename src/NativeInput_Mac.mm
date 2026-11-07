@@ -319,6 +319,7 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 }
 
 VPE_API void VpeInputStopPolling(void) {
+	VpeInputStartControlCapture(0);
 	if (!g_running.load(std::memory_order_acquire)) {
 		return;
 	}

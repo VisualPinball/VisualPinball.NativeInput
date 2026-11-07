@@ -173,6 +173,20 @@ static void CheckGenericButtons() {
 	input.Disconnect(first, 70);
 	Check(actions.size() == 4 && actions.back().value == 0 && VpeInputListDeviceButtons(first, nullptr, 0) == 0,
 		"Release the action and clear button metadata on unplug");
+	const VpeInputControlBinding combo[] = {
+		{VPE_INPUT_SLAM_TILT, 0, VPE_CONTROL_AXIS_ABOVE, 0, .5f, "other"},
+		{VPE_INPUT_SLAM_TILT, 0, VPE_CONTROL_BUTTON, 31, 0.f, "other"},
+	};
+	VpeInputSetControlBindings(combo, 2);
+	input.BeginPoll(80, true, keys);
+	Check(actions.size() == 4, "A held OPD button is only part of the combo");
+	report[18] = 0x60;
+	input.Receive(other, report, sizeof(report), 80);
+	Check(actions.size() == 5 && actions.back().action == VPE_INPUT_SLAM_TILT && actions.back().value == 1,
+		"Thresholds see OPD axis values even when a report repeats the motion timestamp");
+	report[12] = 0;
+	input.Receive(other, report, sizeof(report), 90);
+	Check(actions.size() == 6 && actions.back().value == 0, "Releasing an OPD combo member releases the action");
 	VpeInputSetButtonBindings(nullptr, 0);
 	input.Stop();
 }

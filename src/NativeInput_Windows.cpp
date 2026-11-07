@@ -38,6 +38,8 @@ namespace {
 	constexpr USAGE UsageMultiAxisController = 0x08;
 	constexpr USAGE UsageAxisMin = 0x30;
 	constexpr USAGE UsageAxisMax = 0x38;
+	constexpr USAGE UsageHat = 0x39;
+	constexpr int HatButtonBase = 0x20000;
 
 	struct ActionBindingState {
 		VpeInputAction action;
@@ -57,6 +59,12 @@ namespace {
 		int64_t timestampUsec;
 		const OpenPinballDevice::Axis* opdAxis = nullptr;
 		bool samplePending = false;
+		float bindingValue = std::numeric_limits<float>::quiet_NaN();
+	};
+
+	struct HatDescriptor {
+		HIDP_VALUE_CAPS caps;
+		uint8_t directions = 0;
 	};
 
 	struct HidDevice {
@@ -68,11 +76,12 @@ namespace {
 		PHIDP_PREPARSED_DATA preparsedData = nullptr;
 		HIDP_CAPS caps = {};
 		std::vector<AxisDescriptor> axes;
+		std::vector<HatDescriptor> hats;
 		std::vector<VpeInputButtonInfo> buttons;
 		std::vector<int> buttonReportIds;
 		std::vector<HIDP_DATA> buttonData;
 		std::vector<uint8_t> pressedDataIndices;
-		bool buttonsRegistered = false;
+		bool controlsRegistered = false;
 		std::vector<unsigned char> inputReport;
 		OVERLAPPED readOverlap = {};
 		HANDLE readEvent = NULL;
@@ -262,6 +271,10 @@ namespace {
 		if (valueCaps.UsagePage != UsagePageGenericDesktop) {
 			return;
 		}
+		const bool hasHat = valueCaps.IsRange
+			? valueCaps.Range.UsageMin <= UsageHat && UsageHat <= valueCaps.Range.UsageMax
+			: valueCaps.NotRange.Usage == UsageHat;
+		if (hasHat && !valueCaps.IsAlias) device.hats.push_back({valueCaps});
 
 		if (valueCaps.IsRange) {
 			for (USAGE usage = valueCaps.Range.UsageMin; usage <= valueCaps.Range.UsageMax; usage++) {
@@ -322,9 +335,9 @@ namespace {
 	}
 
 	void CloseHidDevice(HidDevice& device) {
-		if (device.buttonsRegistered) {
+		if (device.controlsRegistered) {
 			NativeButtons::GetState().Disconnect(device.deviceIndex);
-			device.buttonsRegistered = false;
+			device.controlsRegistered = false;
 		}
 		if (device.handle != INVALID_HANDLE_VALUE) {
 			if (device.readPending) {
@@ -469,10 +482,12 @@ namespace {
 		device.pressedDataIndices.resize(device.buttonReportIds.size());
 	}
 
-	void RegisterHidButtons(HidDevice& device) {
-		if (device.buttons.empty()) return;
-		NativeButtons::GetState().Connect(device.deviceIndex, device.stableId, std::move(device.buttons));
-		device.buttonsRegistered = true;
+	void RegisterHidControls(HidDevice& device) {
+		if (device.buttons.empty() && device.axes.empty()) return;
+		std::vector<int> axisIds;
+		for (const auto& axis : device.axes) axisIds.push_back(axis.axisId);
+		NativeButtons::GetState().Connect(device.deviceIndex, device.stableId, std::move(device.buttons), axisIds);
+		device.controlsRegistered = true;
 	}
 
 	bool OpenHidDevice(const std::wstring& path, bool overlapped, HidDevice& device) {
@@ -535,7 +550,18 @@ namespace {
 			return false;
 		}
 		if (device.isOpd) device.buttons = NativeButtons::OpdGenericButtons();
-		else DescribeHidButtons(device);
+		else {
+			DescribeHidButtons(device);
+			constexpr const char* directions[] = {"Up", "Right", "Down", "Left"};
+			for (size_t hat = 0; hat < device.hats.size(); ++hat) {
+				for (int direction = 0; direction < 4; ++direction) {
+					VpeInputButtonInfo button{};
+					button.buttonId = HatButtonBase + static_cast<int>(hat * 4) + direction;
+					std::snprintf(button.name, sizeof(button.name), "Hat %zu %s", hat + 1, directions[direction]);
+					device.buttons.push_back(button);
+				}
+			}
+		}
 		if ((!device.isOpd && device.axes.empty() && device.buttons.empty()) || device.caps.InputReportByteLength == 0) {
 			CloseHidDevice(device);
 			return false;
@@ -592,7 +618,7 @@ namespace {
 			}
 			device.deviceIndex = static_cast<int>(devices.size());
 			devices.push_back(std::move(device));
-			if (openForPolling) RegisterHidButtons(devices.back());
+			if (openForPolling) RegisterHidControls(devices.back());
 		}
 
 		SetupDiDestroyDeviceInfoList(deviceInfoSet);
@@ -608,7 +634,7 @@ namespace {
 		}
 		fresh.deviceIndex = device.deviceIndex;
 		device = std::move(fresh);
-		RegisterHidButtons(device);
+		RegisterHidControls(device);
 		return true;
 	}
 
@@ -662,7 +688,7 @@ namespace {
 			}
 			device.deviceIndex = static_cast<int>(g_hidDevices.size());
 			g_hidDevices.push_back(std::move(device));
-			RegisterHidButtons(g_hidDevices.back());
+			RegisterHidControls(g_hidDevices.back());
 			changed = true;
 		}
 
@@ -702,7 +728,7 @@ namespace {
 		}
 	}
 
-	bool ReadHidButtons(HidDevice& device, char* report, ULONG reportLength) {
+	bool ReadHidButtonData(HidDevice& device, char* report, ULONG reportLength) {
 		if (device.buttonData.empty()) return false;
 		ULONG count = static_cast<ULONG>(device.buttonData.size());
 		if (HidP_GetData(HidP_Input, device.buttonData.data(), &count, device.preparsedData, report, reportLength)
@@ -712,12 +738,21 @@ namespace {
 			const auto index = device.buttonData[i].DataIndex;
 			if (index < device.pressedDataIndices.size()) device.pressedDataIndices[index] = 1;
 		}
-		const auto reportId = device.inputReport[0];
-		return NativeButtons::GetState().Update(device.deviceIndex, [&](const auto& button) {
-			// Reports for other IDs leave these button levels untouched.
-			return device.buttonReportIds[button.buttonId] == reportId
-				? device.pressedDataIndices[button.buttonId] != 0 : button.isPressed != 0;
-		});
+		return true;
+	}
+
+	void ReadHidHats(HidDevice& device, char* report, ULONG reportLength) {
+		constexpr uint8_t directions[] = {1, 3, 2, 6, 4, 12, 8, 9}; // clockwise from up
+		for (auto& hat : device.hats) {
+			ULONG value = 0;
+			if (HidP_GetUsageValue(HidP_Input, UsagePageGenericDesktop, hat.caps.LinkCollection, UsageHat,
+				&value, device.preparsedData, report, reportLength) != HIDP_STATUS_SUCCESS) continue;
+			const auto offset = static_cast<int64_t>(value) - hat.caps.LogicalMin;
+			const auto range = static_cast<int64_t>(hat.caps.LogicalMax) - hat.caps.LogicalMin + 1;
+			hat.directions = 0;
+			if (offset >= 0 && offset < range && (range == 4 || range == 8))
+				hat.directions = directions[offset * (8 / range)];
+		}
 	}
 
 	void PublishHidAxis(AxisDescriptor& axis, int deviceIndex, int64_t timestampUsec,
@@ -741,8 +776,15 @@ namespace {
 			}
 			// Button levels are authoritative even if a firmware repeats its clock.
 			const auto buttonMask = report.PinballButtons();
-			const bool genericChanged = NativeButtons::UpdateOpdGenericButtons(device.deviceIndex, report.GenericButtons());
-			if (device.opdButtons != buttonMask || genericChanged) {
+			const auto genericMask = report.GenericButtons();
+			auto bindingAxis = device.axes.begin();
+			const bool controlsChanged = NativeButtons::GetState().Update(device.deviceIndex, [&](const auto& button) {
+				return (genericMask & (uint32_t{1} << button.buttonId)) != 0;
+			}, [&](int, float previous) {
+				float value;
+				return report.TryReadAxis(*(bindingAxis++)->opdAxis, value) ? value : previous;
+			});
+			if (device.opdButtons != buttonMask || controlsChanged) {
 				device.opdButtons = buttonMask;
 				CaptureButtons(timestampUsec, buttons);
 			}
@@ -761,7 +803,8 @@ namespace {
 
 		auto* report = reinterpret_cast<PCHAR>(device.inputReport.data());
 		const ULONG reportLength = static_cast<ULONG>(device.inputReport.size());
-		if (ReadHidButtons(device, report, reportLength)) CaptureButtons(timestampUsec, buttons);
+		const bool buttonsRead = ReadHidButtonData(device, report, reportLength);
+		ReadHidHats(device, report, reportLength);
 		for (auto& axis : device.axes) {
 			ULONG value = 0;
 			const NTSTATUS status = HidP_GetUsageValue(
@@ -778,6 +821,7 @@ namespace {
 			}
 
 			const float normalized = NormalizeAxisValue(value, axis.valueCaps);
+			axis.bindingValue = normalized;
 			if (std::isnan(normalized)) {
 				continue;
 			}
@@ -786,6 +830,17 @@ namespace {
 			if (publishRawAxes) PublishHidAxis(axis, device.deviceIndex, timestampUsec, pendingEvents);
 			else axis.samplePending = true;
 		}
+		auto bindingAxis = device.axes.begin();
+		const bool controlsChanged = NativeButtons::GetState().Update(device.deviceIndex, [&](const auto& button) {
+			if (button.buttonId >= HatButtonBase) {
+				const int offset = button.buttonId - HatButtonBase;
+				return (device.hats[offset / 4].directions & (1 << (offset % 4))) != 0;
+			}
+			// Reports for other IDs leave these button levels untouched.
+			return buttonsRead && device.buttonReportIds[button.buttonId] == device.inputReport[0]
+				? device.pressedDataIndices[button.buttonId] != 0 : button.isPressed != 0;
+		}, [&](int, float) { return (bindingAxis++)->bindingValue; });
+		if (controlsChanged) CaptureButtons(timestampUsec, buttons);
 	}
 
 	void StartHidRead(HidDevice& device, int64_t timestampUsec, bool publishRawAxes,
@@ -850,7 +905,7 @@ namespace {
 			for (auto& device : g_hidDevices) {
 				// Keep draining button reports in the background so buffered
 				// edges aren't replayed on returning to the game.
-				if (!foreground && !device.buttonsRegistered) continue;
+				if (!foreground && !device.controlsRegistered) continue;
 				const bool wasConnected = device.isConnected;
 				const size_t firstEvent = pendingEvents.size();
 				CompleteHidRead(device, timestampUsec, publishRawAxes, pendingEvents, buttons);
@@ -1091,6 +1146,7 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 }
 
 VPE_API void VpeInputStopPolling(void) {
+	VpeInputStartControlCapture(0);
 	if (g_running.load(std::memory_order_acquire)) {
 		g_running.store(false, std::memory_order_release);
 		if (g_stopEvent != NULL) {

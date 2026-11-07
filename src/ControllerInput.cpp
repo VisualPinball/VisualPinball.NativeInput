@@ -27,6 +27,8 @@
 namespace {
 	constexpr int64_t ScanIntervalUsec = 250000;
 	constexpr int RawGamepadButtonBase = 0x10000;
+	constexpr int HatButtonBase = 0x20000;
+	constexpr std::array<Uint8, 4> HatDirections = {SDL_HAT_UP, SDL_HAT_RIGHT, SDL_HAT_DOWN, SDL_HAT_LEFT};
 	constexpr std::array<const char*, SDL_GAMEPAD_AXIS_COUNT> GamepadAxisNames = {
 		"Left Stick X", "Left Stick Y", "Right Stick X", "Right Stick Y", "Left Trigger", "Right Trigger"
 	};
@@ -37,6 +39,7 @@ namespace {
 		std::vector<VpeInputButtonInfo> buttons;
 		const int rawCount = std::max(SDL_GetNumJoystickButtons(joystick), 0);
 		std::vector<bool> mapped(rawCount);
+		std::vector<Uint8> mappedHatDirections(std::max(SDL_GetNumJoystickHats(joystick), 0));
 		if (gamepad != nullptr) {
 			int count = 0;
 			std::unique_ptr<SDL_GamepadBinding*, decltype(&SDL_free)> bindings(SDL_GetGamepadBindings(gamepad, &count), SDL_free);
@@ -44,6 +47,10 @@ namespace {
 				const auto& binding = *bindings.get()[i];
 				if (binding.input_type == SDL_GAMEPAD_BINDTYPE_BUTTON && binding.input.button >= 0
 					&& binding.input.button < rawCount) mapped[binding.input.button] = true;
+				if (binding.output_type == SDL_GAMEPAD_BINDTYPE_BUTTON && binding.input_type == SDL_GAMEPAD_BINDTYPE_HAT
+					&& binding.input.hat.hat >= 0 && static_cast<size_t>(binding.input.hat.hat) < mappedHatDirections.size()) {
+					mappedHatDirections[binding.input.hat.hat] |= static_cast<Uint8>(binding.input.hat.hat_mask);
+				}
 			}
 			for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; ++i) {
 				const auto id = static_cast<SDL_GamepadButton>(i);
@@ -61,6 +68,16 @@ namespace {
 			button.buttonId = gamepad == nullptr ? i : RawGamepadButtonBase + i;
 			std::snprintf(button.name, sizeof(button.name), "Button %d", i + 1);
 			buttons.push_back(button);
+		}
+		constexpr const char* directions[] = {"Up", "Right", "Down", "Left"};
+		for (size_t hat = 0; hat < mappedHatDirections.size(); ++hat) {
+			for (size_t direction = 0; direction < HatDirections.size(); ++direction) {
+				if (mappedHatDirections[hat] & HatDirections[direction]) continue;
+				VpeInputButtonInfo button{};
+				button.buttonId = HatButtonBase + static_cast<int>(hat * HatDirections.size() + direction);
+				std::snprintf(button.name, sizeof(button.name), "Hat %zu %s", hat + 1, directions[direction]);
+				buttons.push_back(button);
+			}
 		}
 		return buttons;
 	}
@@ -260,7 +277,9 @@ bool ControllerInput::Reconcile(int64_t timestamp) {
 		}
 		auto buttons = DescribeButtons(device->joystick, device->gamepad);
 		if (device->axes.empty() && buttons.empty()) continue;
-		NativeButtons::GetState().Connect(device->info.deviceIndex, stableId, std::move(buttons));
+		std::vector<int> axisIds;
+		for (const auto& axis : device->axes) axisIds.push_back(axis.axisId);
+		NativeButtons::GetState().Connect(device->info.deviceIndex, stableId, std::move(buttons), axisIds);
 		device->info.axisCount = static_cast<int>(device->axes.size());
 		m_devices.push_back(std::move(device));
 		changed = true;
@@ -282,13 +301,6 @@ void ControllerInput::Poll(int64_t timestamp, bool foreground, VpeInputEventCall
 		std::lock_guard<std::mutex> lock(m_snapshotMutex);
 		changed = Reconcile(timestamp);
 		for (auto& device : m_devices) {
-			NativeButtons::GetState().Update(device->info.deviceIndex, [&](const auto& button) {
-				if (device->gamepad == nullptr) return SDL_GetJoystickButton(device->joystick, button.buttonId);
-				if (button.buttonId >= RawGamepadButtonBase) {
-					return SDL_GetJoystickButton(device->joystick, button.buttonId - RawGamepadButtonBase);
-				}
-				return SDL_GetGamepadButton(device->gamepad, static_cast<SDL_GamepadButton>(button.buttonId));
-			});
 			for (auto& axis : device->axes) {
 				const auto value = device->gamepad != nullptr
 					? SDL_GetGamepadAxis(device->gamepad, static_cast<SDL_GamepadAxis>(axis.axisId))
@@ -300,6 +312,19 @@ void ControllerInput::Poll(int64_t timestamp, bool foreground, VpeInputEventCall
 				axis.rawValue = normalized;
 				axis.timestampUsec = timestamp;
 			}
+			auto axis = device->axes.begin();
+			NativeButtons::GetState().Update(device->info.deviceIndex, [&](const auto& button) {
+				if (button.buttonId >= HatButtonBase) {
+					const auto offset = static_cast<size_t>(button.buttonId - HatButtonBase);
+					const auto hat = SDL_GetJoystickHat(device->joystick, static_cast<int>(offset / HatDirections.size()));
+					return (hat & HatDirections[offset % HatDirections.size()]) != 0;
+				}
+				if (device->gamepad == nullptr) return SDL_GetJoystickButton(device->joystick, button.buttonId);
+				if (button.buttonId >= RawGamepadButtonBase) {
+					return SDL_GetJoystickButton(device->joystick, button.buttonId - RawGamepadButtonBase);
+				}
+				return SDL_GetGamepadButton(device->gamepad, static_cast<SDL_GamepadButton>(button.buttonId));
+			}, [&](int, float) { return (axis++)->rawValue; });
 		}
 	}
 	SDL_UnlockJoysticks();

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.16)
 project(VpeNativeInput VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -18,7 +18,7 @@ set(SOURCES
 # Platform-specific sources
 if(WIN32)
     list(APPEND SOURCES src/NativeInput_Windows.cpp)
-    set(PLATFORM_LIBS winmm hid setupapi cfgmgr32)
+    set(PLATFORM_LIBS winmm hid setupapi cfgmgr32 user32)
 elseif(APPLE)
     list(APPEND SOURCES src/NativeInput_Mac.mm src/OpenPinballInput.cpp src/OpenPinballMac.cpp)
     find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
@@ -34,6 +34,35 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 else()
     list(APPEND SOURCES src/NativeInput_Stub.cpp)
     set(PLATFORM_LIBS)
+endif()
+
+if(WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(FetchContent)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_HIDAPI_LIBUSB OFF CACHE BOOL "" FORCE)
+    set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
+    foreach(subsystem AUDIO VIDEO HAPTIC POWER SENSOR DIALOG TRAY)
+        set(SDL_${subsystem} OFF CACHE BOOL "" FORCE)
+    endforeach()
+    if(APPLE)
+        # SDL's macOS HIDAPI driver runs its own report thread. The IOKit and
+        # GameController joystick drivers can be sampled by our polling thread.
+        set(SDL_HIDAPI_JOYSTICK OFF CACHE BOOL "" FORCE)
+    endif()
+    if(POLICY CMP0135)
+        cmake_policy(SET CMP0135 NEW)
+    endif()
+    FetchContent_Declare(SDL3
+        URL https://github.com/libsdl-org/SDL/releases/download/release-3.4.20/SDL3-3.4.20.tar.gz
+        URL_HASH SHA256=f3bb06f55bed9557227a700af2ea62e49497ebdf58037732a731a5fb3ef8581f)
+    FetchContent_MakeAvailable(SDL3)
+    set_target_properties(SDL3-static PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+    target_compile_definitions(SDL3-static PRIVATE SDL_DECLSPEC=)
+    list(APPEND SOURCES src/ControllerInput.cpp)
+    list(APPEND PLATFORM_LIBS SDL3::SDL3-static)
 endif()
 
 # Create shared library
@@ -94,6 +123,9 @@ message(STATUS "NativeInput output directory: ${OUTPUT_DIR}")
 # Set output directory
 set_target_properties(VpeNativeInput PROPERTIES
     OUTPUT_NAME "VisualPinball.NativeInput"
+    CXX_VISIBILITY_PRESET hidden
+    OBJCXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
     LIBRARY_OUTPUT_DIRECTORY ${OUTPUT_DIR}
     RUNTIME_OUTPUT_DIRECTORY ${OUTPUT_DIR}
     ARCHIVE_OUTPUT_DIRECTORY ${OUTPUT_DIR}
@@ -114,4 +146,10 @@ if(NATIVEINPUT_BUILD_TESTS)
     add_executable(OpenPinballDeviceTests tests/OpenPinballDeviceTests.cpp src/OpenPinballInput.cpp)
     target_include_directories(OpenPinballDeviceTests PRIVATE src)
     add_test(NAME OpenPinballDeviceTests COMMAND OpenPinballDeviceTests)
+    if(TARGET SDL3::SDL3-static)
+        add_executable(ControllerInputTests tests/ControllerInputTests.cpp src/ControllerInput.cpp)
+        target_include_directories(ControllerInputTests PRIVATE src)
+        target_link_libraries(ControllerInputTests PRIVATE SDL3::SDL3-static)
+        add_test(NAME ControllerInputTests COMMAND ControllerInputTests)
+    endif()
 endif()

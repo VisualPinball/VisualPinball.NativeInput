@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 
+#include "ControllerInput.h"
 #include "NativeInput.h"
 #include "OpenPinballDevice.h"
 
@@ -89,6 +90,7 @@ namespace {
 	};
 
 	std::thread g_pollingThread;
+	ControllerInput g_controllers;
 	std::atomic<bool> g_running(false);
 	std::atomic<bool> g_protocolVersionChecked(false);
 	VpeInputEventCallback g_callback = nullptr;
@@ -832,6 +834,7 @@ namespace {
 		std::vector<PendingButtons> pendingButtons;
 		int64_t nextHotplugCheckUsec = 0;
 		bool hotplugReconcilePending = false;
+		g_controllers.Start();
 		while (g_running.load(std::memory_order_acquire)) {
 			const int64_t timestampUsec = GetTimestampUsecInternal();
 			CheckHotplug(timestampUsec, nextHotplugCheckUsec, hotplugReconcilePending);
@@ -860,6 +863,8 @@ namespace {
 				}
 			}
 
+			g_controllers.Poll(timestampUsec, isForeground, g_callback, g_userData);
+
 			if (g_pollIntervalUs > 0 && g_timer != NULL) {
 				LARGE_INTEGER dueTime;
 				dueTime.QuadPart = -(static_cast<LONGLONG>(g_pollIntervalUs) * 10);
@@ -875,6 +880,7 @@ namespace {
 				}
 			}
 		}
+		g_controllers.Stop();
 	}
 }
 
@@ -882,6 +888,7 @@ extern "C" {
 
 VPE_API int VpeInputInit(void) {
 	g_protocolVersionChecked.store(false, std::memory_order_release);
+	g_controllers.SetGameplayEnabled(true);
 
 	// Only establish the timestamp epoch once; a re-init while a consumer is
 	// live must not make timestamps jump backwards.
@@ -944,6 +951,7 @@ VPE_API void VpeInputSetGameplayInputEnabled(int enabled) {
 	std::lock_guard<std::mutex> lock(g_bindingsMutex);
 	g_gameplayGateConfigured = true;
 	g_gameplayInputEnabled = enabled != 0;
+	g_controllers.SetGameplayEnabled(enabled != 0);
 }
 
 VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData, int pollIntervalUs) {
@@ -1015,7 +1023,7 @@ VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
 				CopyDeviceInfo(g_hidDevices[i], devices[i]);
 			}
 		}
-		return count;
+		return g_controllers.AppendDevices(devices, maxDevices, count);
 	}
 
 	std::deque<HidDevice> enumeratedDevices;
@@ -1032,6 +1040,9 @@ VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
 }
 
 VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes) {
+	if (deviceIndex >= ControllerInput::FirstDeviceIndex) {
+		return g_controllers.ListAxes(deviceIndex, axes, maxAxes);
+	}
 	if (g_running.load(std::memory_order_acquire)) {
 		std::lock_guard<std::mutex> lock(g_hidDevicesMutex);
 		if (deviceIndex < 0 || deviceIndex >= static_cast<int>(g_hidDevices.size())) {

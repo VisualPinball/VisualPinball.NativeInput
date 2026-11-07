@@ -151,6 +151,9 @@ typedef enum {
 #define VPE_INPUT_DEVICE_NAME_SIZE 128
 #define VPE_INPUT_AXIS_NAME_SIZE 32
 
+// Vendor-defined metadata page for SDL's standardized gamepad axes.
+#define VPE_GAMEPAD_AXIS_USAGE_PAGE 0xff00
+
 // Input device descriptor (matches C# struct layout)
 typedef struct {
 	int32_t deviceIndex;

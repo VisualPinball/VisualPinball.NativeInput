@@ -212,6 +212,12 @@ VPE_API void VpeInputShutdown(void);
 // count: Number of bindings
 VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count);
 
+#ifdef VPE_PLATFORM_WINDOWS
+// Optional on Windows. Suppressed actions retain their published state and
+// reconcile releases on resume. New presses during suppression are ignored.
+VPE_API void VpeInputSetGameplayInputEnabled(int enabled);
+#endif
+
 // Start polling thread
 // callback: Function called for each input event
 // userData: User data passed to callback
@@ -221,7 +227,7 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 // Stop polling thread
 VPE_API void VpeInputStopPolling(void);
 
-// List HID joystick/gamepad-style devices with analog axes.
+// List HID joystick/gamepad-style devices and Open Pinball Device collections.
 // Returns the total available device count. Copies up to maxDevices entries when devices is non-null.
 VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices);
 

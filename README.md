@@ -131,11 +131,19 @@ NativeInputApi.VpeInputStopPolling();
 NativeInputApi.VpeInputShutdown();
 ```
 
+## Open Pinball Device
+
+On Windows, NativeInput recognizes Open Pinball Device 1.x HID collections by their report signature. It exposes named X/Y acceleration and velocity axes and the reported plunger fields. Preassigned OPD buttons that match existing VPE actions work alongside keyboard bindings, including physical tilt and digital nudges. An action stays pressed while any connected source holds it.
+
+Pinscape Pico can expose both OPD and a joystick. Each HID collection retains its own mapping identity. VPE's cabinet setup prefers OPD and lets a player explicitly choose either collection. Pico acceleration and velocity ranges depend on its firmware configuration.
+
+Build the report replay tests with `-DNATIVEINPUT_BUILD_TESTS=ON`, then run `ctest --test-dir build -C Release --output-on-failure` from this repository.
+
 ## Platform Status
 
 | Platform | Status | API Used |
 |----------|--------|----------|
-| Windows  | ✅ Implemented | GetAsyncKeyState, QueryPerformanceCounter |
+| Windows  | Keyboard, HID joystick axes and Open Pinball Device | GetAsyncKeyState, QueryPerformanceCounter, Windows HID |
 | Linux    | ✅ Implemented | X11 keyboard state polling |
 | macOS    | ✅ Implemented | CoreGraphics keyboard state polling |
 
@@ -149,11 +157,10 @@ NativeInputApi.VpeInputShutdown();
 ## Future Enhancements
 
 1. **Gamepad support**: XInput (Windows), SDL/libinput (Linux), GCController (macOS)
-2. **Analog inputs**: Plunger, steering, analog triggers
+2. **Analog inputs**: Joystick and OPD support on macOS and Linux
 3. **Force feedback**: Haptics for nudge, tilt, button feedback
-4. **Hot-plugging**: Detect device connect/disconnect
-5. **Configuration**: JSON-based key mapping files
-6. **Profiles**: Per-table input profiles
+4. **Configuration**: JSON-based key mapping files
+5. **Profiles**: Per-table input profiles
 
 ## License
 

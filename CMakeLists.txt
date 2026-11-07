@@ -105,3 +105,11 @@ install(TARGETS VpeNativeInput
     LIBRARY DESTINATION ${OUTPUT_DIR}
     RUNTIME DESTINATION ${OUTPUT_DIR}
 )
+
+option(NATIVEINPUT_BUILD_TESTS "Build native input report tests" OFF)
+if(NATIVEINPUT_BUILD_TESTS)
+    enable_testing()
+    add_executable(OpenPinballDeviceTests tests/OpenPinballDeviceTests.cpp)
+    target_include_directories(OpenPinballDeviceTests PRIVATE src)
+    add_test(NAME OpenPinballDeviceTests COMMAND OpenPinballDeviceTests)
+endif()

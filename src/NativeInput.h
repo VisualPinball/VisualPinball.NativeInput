@@ -212,8 +212,8 @@ VPE_API void VpeInputShutdown(void);
 // count: Number of bindings
 VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count);
 
-#ifdef VPE_PLATFORM_WINDOWS
-// Optional on Windows. Suppressed actions retain their published state and
+#if defined(VPE_PLATFORM_WINDOWS) || defined(VPE_PLATFORM_LINUX) || defined(VPE_PLATFORM_MACOS)
+// Optional desktop entry point. Suppressed actions retain their published state and
 // reconcile releases on resume. New presses during suppression are ignored.
 VPE_API void VpeInputSetGameplayInputEnabled(int enabled);
 #endif

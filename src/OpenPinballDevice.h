@@ -54,8 +54,13 @@ namespace OpenPinballDevice {
 		static bool Read(const unsigned char* bytes, size_t size, uint8_t reportId, Report& result) {
 			// All 1.x reports begin with a timestamp and two button masks. Fields
 			// after that header can be absent in shorter descriptors.
-			if (size < ReportIdSize + 16 || bytes[0] != reportId) return false;
-			result = {bytes + ReportIdSize, size - ReportIdSize};
+			if (size < ReportIdSize || bytes[0] != reportId) return false;
+			return ReadPayload(bytes + ReportIdSize, size - ReportIdSize, result);
+		}
+
+		static bool ReadPayload(const unsigned char* bytes, size_t size, Report& result) {
+			if (size < 16) return false;
+			result = {bytes, size};
 			return true;
 		}
 

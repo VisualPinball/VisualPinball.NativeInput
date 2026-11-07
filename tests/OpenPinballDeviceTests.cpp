@@ -1,8 +1,9 @@
 // license:GPLv3+
-#include "OpenPinballDevice.h"
+#include "OpenPinballInput.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 using namespace OpenPinballDevice;
 
@@ -13,7 +14,117 @@ static void Check(bool condition, const char* message) {
 	}
 }
 
+static void CheckDescriptor() {
+	// A joystick collection followed by the Pico's OPD collection on the
+	// same HID interface. The signature index comes from the Input item.
+	unsigned char bytes[] = {
+		0x05, 0x01, 0x09, 0x04, 0xa1, 0x01, 0x85, 0x04,
+		0x09, 0x30, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02, 0xc0,
+		0x05, 0x05, 0x09, 0x02, 0xa1, 0x01, 0x85, 0x05,
+		0x79, 71, 0x09, 0x00, 0x15, 0x00, 0x26, 0xff, 0x00,
+		0x75, 0x08, 0x95, 28, 0x81, 0x00, 0xc0,
+	};
+	const auto descriptor = FindDescriptor(bytes, sizeof(bytes));
+	Check(descriptor.reportId == 5 && descriptor.stringIndex == 71 && descriptor.payloadSize == 28,
+		"Find the OPD report in a composite HID descriptor");
+	Check(FindDescriptor(bytes, sizeof(bytes) - 2).stringIndex == 0, "Reject a truncated descriptor");
+	bytes[24] = 4;
+	Check(FindDescriptor(bytes, sizeof(bytes)).stringIndex == 0, "Reject another input field sharing the OPD report ID");
+	bytes[24] = 5;
+	bytes[20] = 3;
+	Check(FindDescriptor(bytes, sizeof(bytes)).stringIndex == 0, "Reject a different application usage");
+	bytes[20] = 2;
+	bytes[sizeof(bytes) - 2] = 0x04;
+	Check(FindDescriptor(bytes, sizeof(bytes)).stringIndex == 71, "Allow other data-array flags");
+	bytes[sizeof(bytes) - 2] = 0x02;
+	Check(FindDescriptor(bytes, sizeof(bytes)).stringIndex == 0, "Reject a variable input field");
+
+	const unsigned char unnumbered[] = {
+		0x05, 0x05, 0x09, 0x02, 0xa1, 0x01, 0x79, 71, 0x09, 0x00,
+		0x75, 0x08, 0x95, 20, 0x81, 0x00, 0xc0,
+	};
+	const auto shortReport = FindDescriptor(unnumbered, sizeof(unnumbered));
+	Check(shortReport.reportId == 0 && shortReport.stringIndex == 71 && shortReport.payloadSize == 20,
+		"Accept an unnumbered acceleration-only report");
+}
+
+static bool CheckUsbString(const char* signature, bool truncate = false) {
+	return VerifySignature(71, [&](uint8_t index, uint16_t language, auto& bytes) {
+		if (index == 0 && language == 0) {
+			bytes[0] = 4;
+			bytes[1] = 3;
+			bytes[2] = 9;
+			bytes[3] = 4;
+			return 4;
+		}
+		if (index != 71 || language != 0x0409) return -1;
+		bytes.fill(0);
+		const int size = static_cast<int>(2 + std::strlen(signature) * 2);
+		bytes[0] = static_cast<unsigned char>(size);
+		bytes[1] = 3;
+		for (int i = 2; i < size; i += 2) bytes[i] = signature[(i - 2) / 2];
+		return truncate ? size - 2 : size;
+	}) == ProbeResult::Found;
+}
+
+static void CheckPollingState() {
+	Input input;
+	std::vector<VpeInputEvent> events;
+	input.Start([](const VpeInputEvent* event, void* data) {
+		static_cast<std::vector<VpeInputEvent>*>(data)->push_back(*event);
+	}, &events);
+	const int first = input.Connect("first", "Pinscape Pico", {5, 71, 28}, 0);
+	const int second = input.Connect("second", "Other OPD", {0, 71, 20}, 0);
+	VpeInputDeviceInfo devices[2]{};
+	Check(input.ListDevices(devices, 2) == 2 && std::strcmp(devices[0].displayName, "Pinscape Pico (OPD)") == 0
+		&& devices[0].axisCount == 6 && devices[1].axisCount == 2, "Expose separate devices and only complete axes");
+
+	Keys keys{};
+	input.BeginPoll(10, true, keys);
+	unsigned char report[29]{};
+	report[0] = 5;
+	report[14] = 2; // Left flipper, bit 9.
+	report[18] = 0x80; // Acceleration X = -32768.
+	events.clear();
+	input.Receive(first, report, sizeof(report) - 1, 10);
+	Check(events.empty(), "Ignore a truncated report");
+	input.Receive(first, report, sizeof(report), 10);
+	Check(events.size() == 7 && events[0].action == VPE_INPUT_LEFT_FLIPPER && events[0].value == 1
+		&& events[1].value == -1 && events[1].deviceIndex == first, "Publish a button and all six signed axes");
+	VpeInputAxisInfo axes[6]{};
+	Check(input.ListAxes(first, axes, 6) == 6 && axes[0].rawValue == -1 && axes[0].timestampUsec == 10
+		&& axes[0].kind == VPE_AXIS_KIND_ACCELERATION && axes[2].kind == VPE_AXIS_KIND_VELOCITY,
+		"Expose the live axis snapshot");
+
+	keys[VPE_INPUT_LEFT_FLIPPER] = true;
+	input.BeginPoll(20, true, keys);
+	input.Receive(second, report + 1, 20, 20);
+	events.clear();
+	report[14] = 0;
+	input.Receive(first, report, sizeof(report), 20);
+	Check(events.empty(), "A repeated timestamp suppresses motion and other sources preserve a held button");
+	keys[VPE_INPUT_LEFT_FLIPPER] = false;
+	input.BeginPoll(30, true, keys);
+	Check(events.empty(), "An unnumbered controller still holds the shared button");
+	input.SetGameplayEnabled(0);
+	input.Disconnect(second, 30);
+	Check(events.size() == 1 && events[0].eventType == VPE_INPUT_EVENT_DEVICES_CHANGED
+		&& input.ListAxes(second, nullptr, 0) == 0, "Hot unplug updates the snapshot during pause");
+	input.SetGameplayEnabled(1);
+	input.BeginPoll(40, true, keys);
+	Check(events.size() == 2 && events[1].eventType == VPE_INPUT_EVENT_ACTION && events[1].value == 0,
+		"Release the shared action on resume");
+	input.Stop();
+	Check(input.ListDevices(nullptr, 0) == 0, "Clear snapshots when polling stops");
+}
+
 int main() {
+	CheckDescriptor();
+	Check(CheckUsbString("OpenPinballDeviceStruct/1.0"), "Read the signature in the advertised USB language");
+	Check(!CheckUsbString("OpenPinballDeviceStruct/1.0", true), "Reject a truncated USB string");
+	Check(!CheckUsbString("OpenPinballDeviceStruct/2.0"), "Reject an incompatible USB signature");
+	CheckPollingState();
+
 	Check(SupportsVersion(L"OpenPinballDeviceStruct/1.0"), "Recognize the Pico signature");
 	Check(SupportsVersion(L"OpenPinballDeviceStruct/1.12"), "Accept a future minor version");
 	Check(!SupportsVersion(L"OpenPinballDeviceStruct/2.0"), "Reject a different major version");

@@ -3,7 +3,7 @@
 
 #ifdef __APPLE__
 
-#include "NativeInput.h"
+#include "OpenPinballInput.h"
 
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
@@ -23,7 +23,6 @@ namespace {
 	struct KeyBindingState {
 		VpeInputAction action;
 		CGKeyCode nativeKeyCode;
-		float previousValue;
 	};
 
 	std::thread g_pollingThread;
@@ -31,12 +30,11 @@ namespace {
 	std::atomic<bool> g_protocolVersionChecked(false);
 	std::condition_variable g_waitCondition;
 	std::mutex g_waitMutex;
-	VpeInputEventCallback g_callback = nullptr;
-	void* g_userData = nullptr;
+	OpenPinballDevice::Input g_input;
+	std::mutex g_bindingsMutex;
 	int g_pollIntervalUs = 500;
 	Clock::time_point g_startTime;
 	std::vector<KeyBindingState> g_bindings;
-	bool g_wasForeground = false;
 
 	int64_t GetTimestampUsecInternal() {
 		return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - g_startTime).count();
@@ -215,70 +213,28 @@ namespace {
 		return CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, nativeKeyCode);
 	}
 
-	void EmitReleaseForPressedKeys(int64_t timestampUsec) {
-		if (g_callback == nullptr) {
-			for (auto& binding : g_bindings) {
-				binding.previousValue = 0.0f;
-			}
-			return;
-		}
-
-		for (auto& binding : g_bindings) {
-			if (binding.previousValue <= 0.0f) {
-				continue;
-			}
-
-			binding.previousValue = 0.0f;
-
-			VpeInputEvent event{};
-			event.timestampUsec = timestampUsec;
-			event.eventType = VPE_INPUT_EVENT_ACTION;
-			event.action = static_cast<int32_t>(binding.action);
-			event.value = 0.0f;
-			g_callback(&event, g_userData);
-		}
-	}
-
 	void PollingThreadFunc() {
 		@autoreleasepool {
 			VpeSetThreadPriority();
-
+			OpenPinballDevice::Transport transport(g_input);
 			while (g_running.load(std::memory_order_acquire)) {
-				const int64_t timestampUsec = GetTimestampUsecInternal();
-				const bool isForeground = IsCurrentProcessForeground();
-
-				if (!isForeground) {
-					if (g_wasForeground) {
-						EmitReleaseForPressedKeys(timestampUsec);
-					}
-					g_wasForeground = false;
-				} else {
-					g_wasForeground = true;
-
-					for (auto& binding : g_bindings) {
-						const float currentValue = IsPressed(binding.nativeKeyCode) ? 1.0f : 0.0f;
-						if (currentValue == binding.previousValue) {
-							continue;
+				const int64_t timestamp = GetTimestampUsecInternal();
+				OpenPinballDevice::Keys keys{};
+				bool foreground;
+				{
+					std::lock_guard<std::mutex> lock(g_bindingsMutex);
+					foreground = IsCurrentProcessForeground();
+					if (foreground) {
+						for (const auto& binding : g_bindings) {
+							keys[binding.action] |= IsPressed(binding.nativeKeyCode);
 						}
-
-						binding.previousValue = currentValue;
-						if (g_callback == nullptr) {
-							continue;
-						}
-
-						VpeInputEvent event{};
-						event.timestampUsec = timestampUsec;
-						event.eventType = VPE_INPUT_EVENT_ACTION;
-						event.action = static_cast<int32_t>(binding.action);
-						event.value = currentValue;
-						g_callback(&event, g_userData);
 					}
 				}
+				g_input.BeginPoll(timestamp, foreground, keys);
+				transport.Poll(timestamp);
 
 				std::unique_lock<std::mutex> lock(g_waitMutex);
-				g_waitCondition.wait_for(
-					lock,
-					std::chrono::microseconds(g_pollIntervalUs > 0 ? g_pollIntervalUs : 500),
+				g_waitCondition.wait_for(lock, std::chrono::microseconds(g_pollIntervalUs),
 					[] { return !g_running.load(std::memory_order_acquire); });
 			}
 		}
@@ -289,8 +245,8 @@ extern "C" {
 
 VPE_API int VpeInputInit(void) {
 	g_protocolVersionChecked.store(false, std::memory_order_release);
+	g_input.ResetGameplayGate();
 	g_startTime = Clock::now();
-	g_wasForeground = false;
 	return 1;
 }
 
@@ -303,19 +259,19 @@ VPE_API void VpeInputShutdown(void) {
 	VpeInputStopPolling();
 	g_protocolVersionChecked.store(false, std::memory_order_release);
 	g_bindings.clear();
-	g_wasForeground = false;
 }
 
 VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count) {
+	std::lock_guard<std::mutex> lock(g_bindingsMutex);
 	g_bindings.clear();
-	g_wasForeground = false;
 
 	if (bindings == nullptr || count <= 0) {
 		return;
 	}
 
 	for (int i = 0; i < count; ++i) {
-		if (bindings[i].bindingType != VPE_BINDING_KEYBOARD) {
+		if (bindings[i].bindingType != VPE_BINDING_KEYBOARD
+			|| bindings[i].action < 0 || bindings[i].action >= VPE_INPUT_MAX) {
 			continue;
 		}
 
@@ -327,9 +283,12 @@ VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count) {
 		g_bindings.push_back({
 			static_cast<VpeInputAction>(bindings[i].action),
 			nativeKeyCode,
-			0.0f,
 		});
 	}
+}
+
+VPE_API void VpeInputSetGameplayInputEnabled(int enabled) {
+	g_input.SetGameplayEnabled(enabled);
 }
 
 VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData, int pollIntervalUs) {
@@ -338,10 +297,8 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 		return 0;
 	}
 
-	g_callback = callback;
-	g_userData = userData;
+	g_input.Start(callback, userData);
 	g_pollIntervalUs = pollIntervalUs > 0 ? pollIntervalUs : 500;
-	g_wasForeground = false;
 	g_running.store(true, std::memory_order_release);
 
 	try {
@@ -363,19 +320,15 @@ VPE_API void VpeInputStopPolling(void) {
 	if (g_pollingThread.joinable()) {
 		g_pollingThread.join();
 	}
+	g_input.Stop();
 }
 
 VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices) {
-	(void)devices;
-	(void)maxDevices;
-	return 0;
+	return g_input.ListDevices(devices, maxDevices);
 }
 
 VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes) {
-	(void)deviceIndex;
-	(void)axes;
-	(void)maxAxes;
-	return 0;
+	return g_input.ListAxes(deviceIndex, axes, maxAxes);
 }
 
 VPE_API int64_t VpeGetTimestampUsec(void) {

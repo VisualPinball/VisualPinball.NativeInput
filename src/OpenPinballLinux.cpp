@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <linux/hidraw.h>
 #include <linux/input.h>
 #include <linux/usb/ch9.h>
@@ -56,15 +57,25 @@ namespace OpenPinballDevice {
 			File hid;
 			int index;
 		};
+		struct PendingProbe {
+			fs::path entry;
+			fs::path hidDevice;
+			File hid;
+			Descriptor descriptor;
+			std::string id;
+			std::string name;
+			std::future<ProbeResult> result;
+		};
 
 		Input& input;
 		std::map<fs::path, Device> devices;
 		std::map<fs::path, int64_t> retryAfter;
+		std::unique_ptr<PendingProbe> pending;
 		int64_t nextScan = 0;
 
 		explicit Impl(Input& input) : input(input) {}
 
-		ProbeResult Connect(const fs::path& entry, const fs::path& hidDevice, int64_t timestamp) {
+		ProbeResult BeginProbe(const fs::path& entry, const fs::path& hidDevice) {
 			std::array<unsigned char, MaxDescriptorSize + 1> descriptorBytes;
 			std::ifstream descriptorFile(hidDevice / "report_descriptor", std::ios::binary);
 			descriptorFile.read(reinterpret_cast<char*>(descriptorBytes.data()), descriptorBytes.size());
@@ -82,9 +93,6 @@ namespace OpenPinballDevice {
 			if (hid.fd < 0 || ioctl(hid.fd, HIDIOCGRAWINFO, &rawInfo) < 0
 				|| fs::canonical(entry / "device", pathError) != hidDevice) return ProbeResult::Retry;
 			if (rawInfo.bustype != BUS_USB) return ProbeResult::NotOpd;
-			const auto signature = ReadSignature(usbDevice, descriptor.stringIndex);
-			if (signature != ProbeResult::Found) return signature;
-
 			char name[VPE_INPUT_DEVICE_NAME_SIZE]{};
 			if (ioctl(hid.fd, HIDIOCGRAWNAME(sizeof(name) - 1), name) <= 0) {
 				std::snprintf(name, sizeof(name), "Open Pinball Device");
@@ -94,9 +102,32 @@ namespace OpenPinballDevice {
 			std::getline(serialFile, serial);
 			const auto id = StableId("linux", usbInterface.filename().string(), serial,
 				static_cast<uint16_t>(rawInfo.vendor), static_cast<uint16_t>(rawInfo.product), descriptor.reportId);
-			const int index = input.Connect(id, name, descriptor, timestamp);
-			devices.emplace(hidDevice, Device{std::move(hid), index});
+			try {
+				// The USB control transfer may time out. Keep the open hidraw
+				// handle here and perform only the signature request off-thread.
+				pending = std::make_unique<PendingProbe>(PendingProbe{entry, hidDevice, std::move(hid), descriptor, id, name,
+					std::async(std::launch::async, [usbDevice, descriptor] {
+						return ReadSignature(usbDevice, descriptor.stringIndex);
+					})});
+			} catch (const std::system_error&) {
+				return ProbeResult::Retry;
+			}
 			return ProbeResult::Found;
+		}
+
+		void FinishProbe(int64_t timestamp) {
+			if (!pending || pending->result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+			auto probe = std::move(pending);
+			const auto result = probe->result.get();
+			std::error_code error;
+			if (fs::canonical(probe->entry / "device", error) != probe->hidDevice || error) return;
+			if (result != ProbeResult::Found) {
+				retryAfter[probe->hidDevice] = NextProbe(result, timestamp);
+				return;
+			}
+			retryAfter.erase(probe->hidDevice);
+			const int index = input.Connect(probe->id, probe->name, probe->descriptor, timestamp);
+			devices.emplace(probe->hidDevice, Device{std::move(probe->hid), index});
 		}
 
 		void Scan(int64_t timestamp) {
@@ -110,9 +141,9 @@ namespace OpenPinballDevice {
 
 				const auto retry = retryAfter.find(hidDevice);
 				if (retry != retryAfter.end() && timestamp < retry->second) continue;
-				const auto result = Connect(entry, hidDevice, timestamp);
-				if (result == ProbeResult::Found) retryAfter.erase(hidDevice);
-				else retryAfter[hidDevice] = NextProbe(result, timestamp);
+				const auto result = BeginProbe(entry, hidDevice);
+				if (result == ProbeResult::Found) break;
+				retryAfter[hidDevice] = NextProbe(result, timestamp);
 			}
 			for (auto it = retryAfter.begin(); it != retryAfter.end();) {
 				std::error_code pathError;
@@ -141,7 +172,8 @@ namespace OpenPinballDevice {
 					++it;
 				}
 			}
-			if (timestamp >= nextScan) {
+			FinishProbe(timestamp);
+			if (!pending && timestamp >= nextScan) {
 				nextScan = timestamp + 1000000;
 				Scan(timestamp);
 			}

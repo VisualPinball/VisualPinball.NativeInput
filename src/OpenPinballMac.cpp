@@ -5,11 +5,20 @@
 #include <IOKit/hid/IOHIDLib.h>
 #include <IOKit/usb/IOUSBLib.h>
 
+#include <future>
 #include <map>
+#include <utility>
 
 namespace OpenPinballDevice {
 	namespace {
 		CFStringRef PollMode() { return CFSTR("VpeOpenPinballInput"); }
+
+		struct Service {
+			io_service_t value;
+			explicit Service(io_service_t value) : value(value) {}
+			Service(Service&& other) noexcept : value(std::exchange(other.value, IO_OBJECT_NULL)) {}
+			~Service() { if (value != IO_OBJECT_NULL) IOObjectRelease(value); }
+		};
 
 		int64_t ReadNumber(io_service_t service, CFStringRef key, int64_t fallback = 0) {
 			const auto property = IORegistryEntryCreateCFProperty(service, key, kCFAllocatorDefault, 0);
@@ -108,16 +117,25 @@ namespace OpenPinballDevice {
 				}
 			}
 		};
+		struct PendingProbe {
+			uint64_t registryId;
+			std::unique_ptr<Device> device;
+			Descriptor descriptor;
+			std::string id;
+			std::string name;
+			std::future<ProbeResult> result;
+		};
 
 		Input& input;
 		std::map<uint64_t, std::unique_ptr<Device>> devices;
 		std::map<uint64_t, int64_t> retryAfter;
+		std::unique_ptr<PendingProbe> pending;
 		int64_t timestamp = 0;
 		int64_t nextScan = 0;
 
 		explicit Impl(Input& input) : input(input) {}
 
-		ProbeResult Connect(io_service_t service, uint64_t registryId) {
+		ProbeResult BeginProbe(io_service_t service, uint64_t registryId) {
 			const auto property = IORegistryEntryCreateCFProperty(service, CFSTR(kIOHIDReportDescriptorKey), kCFAllocatorDefault, 0);
 			if (property == nullptr) return ProbeResult::Retry;
 			Descriptor descriptor;
@@ -130,33 +148,52 @@ namespace OpenPinballDevice {
 			if (descriptor.stringIndex == 0) return ProbeResult::NotOpd;
 
 			int interfaceNumber = -1;
-			const auto usb = FindUsbDevice(service, interfaceNumber);
-			if (usb == IO_OBJECT_NULL) return ProbeResult::NotOpd;
-			const auto location = static_cast<uint32_t>(ReadNumber(usb, CFSTR("locationID")));
-			const auto vendor = static_cast<uint16_t>(ReadNumber(usb, CFSTR("idVendor")));
-			const auto product = static_cast<uint16_t>(ReadNumber(usb, CFSTR("idProduct")));
+			Service usb(FindUsbDevice(service, interfaceNumber));
+			if (usb.value == IO_OBJECT_NULL) return ProbeResult::NotOpd;
+			const auto location = static_cast<uint32_t>(ReadNumber(usb.value, CFSTR("locationID")));
+			const auto vendor = static_cast<uint16_t>(ReadNumber(usb.value, CFSTR("idVendor")));
+			const auto product = static_cast<uint16_t>(ReadNumber(usb.value, CFSTR("idProduct")));
 
 			const auto hid = IOHIDDeviceCreate(kCFAllocatorDefault, service);
-			if (hid == nullptr) {
-				IOObjectRelease(usb);
-				return ProbeResult::Retry;
-			}
+			if (hid == nullptr) return ProbeResult::Retry;
 			auto device = std::make_unique<Device>(*this, hid);
 			device->opened = IOHIDDeviceOpen(hid, kIOHIDOptionsTypeNone) == kIOReturnSuccess;
-			const auto signature = device->opened && location != 0
-				? ReadSignature(usb, descriptor.stringIndex) : ProbeResult::Retry;
-			IOObjectRelease(usb);
-			if (signature != ProbeResult::Found) return signature;
+			if (!device->opened || location == 0) return ProbeResult::Retry;
 			const auto serial = ReadString(hid, CFSTR(kIOHIDSerialNumberKey));
 			const auto name = ReadString(hid, CFSTR(kIOHIDProductKey));
 			const auto id = StableId("mac", std::to_string(location) + ":" + std::to_string(interfaceNumber),
 				serial, vendor, product, descriptor.reportId);
-			device->index = input.Connect(id, name.empty() ? "Open Pinball Device" : name, descriptor, timestamp);
-			IOHIDDeviceRegisterRemovalCallback(hid, Device::OnRemoval, device.get());
-			IOHIDDeviceRegisterInputReportCallback(hid, device->bytes.data(), device->bytes.size(), Device::OnReport, device.get());
-			IOHIDDeviceScheduleWithRunLoop(hid, CFRunLoopGetCurrent(), PollMode());
-			devices.emplace(registryId, std::move(device));
+			try {
+				// Keep IOHID report registration on the polling run loop. Only
+				// the temporary USB device's signature request runs elsewhere.
+				pending = std::make_unique<PendingProbe>(PendingProbe{registryId, std::move(device), descriptor, id, name,
+					std::async(std::launch::async, [usb = std::move(usb), descriptor] {
+						return ReadSignature(usb.value, descriptor.stringIndex);
+					})});
+			} catch (const std::system_error&) {
+				return ProbeResult::Retry;
+			}
 			return ProbeResult::Found;
+		}
+
+		void FinishProbe() {
+			if (!pending || pending->result.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+			auto probe = std::move(pending);
+			const auto result = probe->result.get();
+			if (result != ProbeResult::Found) {
+				retryAfter[probe->registryId] = NextProbe(result, timestamp);
+				return;
+			}
+			Service present(IOServiceGetMatchingService(MACH_PORT_NULL, IORegistryEntryIDMatching(probe->registryId)));
+			if (present.value == IO_OBJECT_NULL) return;
+			retryAfter.erase(probe->registryId);
+			auto& device = probe->device;
+			device->index = input.Connect(probe->id, probe->name.empty() ? "Open Pinball Device" : probe->name,
+				probe->descriptor, timestamp);
+			IOHIDDeviceRegisterRemovalCallback(device->hid, Device::OnRemoval, device.get());
+			IOHIDDeviceRegisterInputReportCallback(device->hid, device->bytes.data(), device->bytes.size(), Device::OnReport, device.get());
+			IOHIDDeviceScheduleWithRunLoop(device->hid, CFRunLoopGetCurrent(), PollMode());
+			devices.emplace(probe->registryId, std::move(device));
 		}
 
 		void RemoveDisconnected(const std::map<uint64_t, io_service_t>* present = nullptr) {
@@ -176,6 +213,7 @@ namespace OpenPinballDevice {
 				if (CFRunLoopRunInMode(PollMode(), 0, true) != kCFRunLoopRunHandledSource) break;
 			}
 			RemoveDisconnected();
+			FinishProbe();
 			if (timestamp < nextScan) return;
 			nextScan = timestamp + 1000000;
 			io_iterator_t iterator;
@@ -193,12 +231,13 @@ namespace OpenPinballDevice {
 			if (IOIteratorIsValid(iterator)) {
 				RemoveDisconnected(&present);
 				for (const auto& [id, service] : present) {
+					if (pending) break;
 					if (devices.find(id) != devices.end()) continue;
 					const auto retry = retryAfter.find(id);
 					if (retry != retryAfter.end() && timestamp < retry->second) continue;
-					const auto result = Connect(service, id);
-					if (result == ProbeResult::Found) retryAfter.erase(id);
-					else retryAfter[id] = NextProbe(result, timestamp);
+					const auto result = BeginProbe(service, id);
+					if (result == ProbeResult::Found) break;
+					retryAfter[id] = NextProbe(result, timestamp);
 				}
 				for (auto it = retryAfter.begin(); it != retryAfter.end();) {
 					if (present.count(it->first) == 0) it = retryAfter.erase(it);

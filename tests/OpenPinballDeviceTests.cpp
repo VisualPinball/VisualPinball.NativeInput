@@ -107,6 +107,12 @@ static void CheckPollingState() {
 	input.BeginPoll(30, true, keys);
 	Check(events.empty(), "An unnumbered controller still holds the shared button");
 	input.SetGameplayEnabled(0);
+	report[1] = 20;
+	report[18] = 0x40;
+	input.Receive(first, report, sizeof(report), 30);
+	Check(events.empty(), "Do not send OPD axis callbacks during gameplay pause");
+	Check(input.ListAxes(first, axes, 6) == 6 && axes[0].rawValue == .5f && axes[0].timestampUsec == 30,
+		"Keep OPD calibration telemetry current during gameplay pause");
 	input.Disconnect(second, 30);
 	Check(events.size() == 1 && events[0].eventType == VPE_INPUT_EVENT_DEVICES_CHANGED
 		&& input.ListAxes(second, nullptr, 0) == 0, "Hot unplug updates the snapshot during pause");
@@ -114,6 +120,10 @@ static void CheckPollingState() {
 	input.BeginPoll(40, true, keys);
 	Check(events.size() == 2 && events[1].eventType == VPE_INPUT_EVENT_ACTION && events[1].value == 0,
 		"Release the shared action on resume");
+	report[1] = 40;
+	input.Receive(first, report, sizeof(report), 50);
+	Check(events.size() == 8 && events[2].eventType == VPE_INPUT_EVENT_AXIS && events[2].value == .5f,
+		"Resume OPD axis callbacks when gameplay resumes");
 	input.Stop();
 	Check(input.ListDevices(nullptr, 0) == 0, "Clear snapshots when polling stops");
 }

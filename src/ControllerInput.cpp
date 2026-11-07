@@ -178,6 +178,8 @@ void ControllerInput::Start() {
 		SDL_SetJoystickEventsEnabled(false);
 		SDL_SetGamepadEventsEnabled(false);
 		SDL_SetEventEnabled(SDL_EVENT_JOYSTICK_UPDATE_COMPLETE, false);
+	} else {
+		SDL_LogError(SDL_LOG_CATEGORY_INPUT, "VPE controller input initialization failed: %s", SDL_GetError());
 	}
 	m_wasPublishing = false;
 	m_nextScan = 0;

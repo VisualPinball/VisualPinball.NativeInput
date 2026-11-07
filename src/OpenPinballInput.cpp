@@ -118,7 +118,9 @@ namespace OpenPinballDevice {
 		}
 		// Controls use every report, including repeated motion timestamps.
 		if (buttonsChanged) PublishActions(timestamp);
-		if (m_foreground) {
+		if (eventCount > 0) {
+			std::lock_guard<std::mutex> lock(m_gameplayMutex);
+			if (!m_foreground || m_gate == Gate::Disabled) return;
 			for (int i = 0; i < eventCount; ++i) Emit(events[i]);
 		}
 	}

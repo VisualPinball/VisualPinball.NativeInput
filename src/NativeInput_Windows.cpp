@@ -764,7 +764,7 @@ namespace {
 		}
 	}
 
-	void ParseInputReport(HidDevice& device, DWORD bytesRead, int64_t timestampUsec, bool publishRawAxes,
+	void ParseInputReport(HidDevice& device, DWORD bytesRead, int64_t timestampUsec, bool publishAxes,
 		std::vector<PendingAxisEvent>& pendingEvents, std::vector<PendingButtons>& buttons) {
 		if (device.preparsedData == nullptr || bytesRead != device.inputReport.size()) {
 			return;
@@ -795,7 +795,7 @@ namespace {
 				if (report.TryReadAxis(*axis.opdAxis, value)) {
 					axis.rawValue = value;
 					axis.timestampUsec = sampleUsec;
-					pendingEvents.push_back({sampleUsec, device.deviceIndex, axis.axisId, value});
+					if (publishAxes) pendingEvents.push_back({sampleUsec, device.deviceIndex, axis.axisId, value});
 				}
 			}
 			return;
@@ -827,7 +827,7 @@ namespace {
 			}
 			axis.rawValue = normalized;
 			axis.timestampUsec = timestampUsec;
-			if (publishRawAxes) PublishHidAxis(axis, device.deviceIndex, timestampUsec, pendingEvents);
+			if (publishAxes) PublishHidAxis(axis, device.deviceIndex, timestampUsec, pendingEvents);
 			else axis.samplePending = true;
 		}
 		auto bindingAxis = device.axes.begin();
@@ -843,7 +843,7 @@ namespace {
 		if (controlsChanged) CaptureButtons(timestampUsec, buttons);
 	}
 
-	void StartHidRead(HidDevice& device, int64_t timestampUsec, bool publishRawAxes,
+	void StartHidRead(HidDevice& device, int64_t timestampUsec, bool publishAxes,
 		std::vector<PendingAxisEvent>& pendingEvents, std::vector<PendingButtons>& buttons) {
 		if (device.handle == INVALID_HANDLE_VALUE || device.readPending || device.inputReport.empty()) {
 			return;
@@ -858,7 +858,7 @@ namespace {
 			&bytesRead,
 			&device.readOverlap);
 		if (ok) {
-			ParseInputReport(device, bytesRead, timestampUsec, publishRawAxes, pendingEvents, buttons);
+			ParseInputReport(device, bytesRead, timestampUsec, publishAxes, pendingEvents, buttons);
 			return;
 		}
 
@@ -873,7 +873,7 @@ namespace {
 		}
 	}
 
-	void CompleteHidRead(HidDevice& device, int64_t timestampUsec, bool publishRawAxes,
+	void CompleteHidRead(HidDevice& device, int64_t timestampUsec, bool publishAxes,
 		std::vector<PendingAxisEvent>& pendingEvents, std::vector<PendingButtons>& buttons) {
 		if (!device.readPending || device.readEvent == NULL) {
 			return;
@@ -886,7 +886,7 @@ namespace {
 		const BOOL ok = GetOverlappedResult(device.handle, &device.readOverlap, &bytesRead, FALSE);
 		device.readPending = false;
 		if (ok && bytesRead > 0) {
-			ParseInputReport(device, bytesRead, timestampUsec, publishRawAxes, pendingEvents, buttons);
+			ParseInputReport(device, bytesRead, timestampUsec, publishAxes, pendingEvents, buttons);
 		} else if (!ok) {
 			// Read completed with failure — typically device removal mid-read.
 			DisconnectHidDevice(device);
@@ -894,7 +894,7 @@ namespace {
 		}
 	}
 
-	bool PollHidDevices(int64_t timestampUsec, bool foreground, bool publishRawAxes, bool refreshRawAxes,
+	bool PollHidDevices(int64_t timestampUsec, bool foreground, bool publishAxes, bool refreshRawAxes,
 		std::vector<PendingAxisEvent>& pendingEvents, std::vector<PendingButtons>& buttons) {
 		pendingEvents.clear();
 		buttons.clear();
@@ -908,8 +908,8 @@ namespace {
 				if (!foreground && !device.controlsRegistered) continue;
 				const bool wasConnected = device.isConnected;
 				const size_t firstEvent = pendingEvents.size();
-				CompleteHidRead(device, timestampUsec, publishRawAxes, pendingEvents, buttons);
-				StartHidRead(device, timestampUsec, publishRawAxes, pendingEvents, buttons);
+				CompleteHidRead(device, timestampUsec, publishAxes, pendingEvents, buttons);
+				StartHidRead(device, timestampUsec, publishAxes, pendingEvents, buttons);
 				if (wasConnected && !device.isConnected) {
 					disconnected = true;
 					pendingEvents.resize(firstEvent);
@@ -975,22 +975,22 @@ namespace {
 		std::vector<PendingButtons> pendingButtons;
 		int64_t nextHotplugCheckUsec = 0;
 		bool hotplugReconcilePending = false;
-		bool wasPublishingRawAxes = false;
+		bool wasPublishingAxes = false;
 		g_controllers.Start();
 		while (g_running.load(std::memory_order_acquire)) {
 			const int64_t timestampUsec = GetTimestampUsecInternal();
 			CheckHotplug(timestampUsec, nextHotplugCheckUsec, hotplugReconcilePending);
 			const bool isForeground = IsCurrentProcessForeground();
 			g_controllers.Poll(timestampUsec, isForeground, g_callback, g_userData);
-			bool publishRawAxes;
+			bool publishAxes;
 			{
 				std::lock_guard<std::mutex> lock(g_bindingsMutex);
-				publishRawAxes = isForeground && g_gameplayInputEnabled;
+				publishAxes = isForeground && g_gameplayInputEnabled;
 			}
-			const bool refreshRawAxes = publishRawAxes && !wasPublishingRawAxes;
-			const bool disconnected = PollHidDevices(timestampUsec, isForeground, publishRawAxes,
+			const bool refreshRawAxes = publishAxes && !wasPublishingAxes;
+			const bool disconnected = PollHidDevices(timestampUsec, isForeground, publishAxes,
 				refreshRawAxes, pendingAxisEvents, pendingButtons);
-			wasPublishingRawAxes = publishRawAxes;
+			wasPublishingAxes = publishAxes;
 			{
 				std::lock_guard<std::mutex> lock(g_bindingsMutex);
 				for (auto& binding : g_bindings) {
@@ -1008,7 +1008,7 @@ namespace {
 				}
 			}
 			if (disconnected) EmitDevicesChangedEvent(timestampUsec);
-			if (isForeground) {
+			if (publishAxes) {
 				for (const auto& event : pendingAxisEvents) {
 					EmitAxisEvent(event.timestampUsec, event.deviceIndex, event.axisId, event.value);
 				}
@@ -1087,7 +1087,9 @@ VPE_API void VpeInputShutdown(void) {
 
 VPE_API void VpeInputSetBindings(const VpeInputBinding* bindings, int count) {
 	std::lock_guard<std::mutex> lock(g_bindingsMutex);
-	g_bindings.clear();
+	// A live remap only replaces keyboard sources. Keep action latches so
+	// previously published presses can still release after remapping or pause.
+	for (auto& binding : g_bindings) binding.keys.clear();
 
 	for (int i = 0; bindings != nullptr && i < count; i++) {
 		if (bindings[i].bindingType == VPE_BINDING_KEYBOARD

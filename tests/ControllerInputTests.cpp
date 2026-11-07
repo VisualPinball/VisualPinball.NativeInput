@@ -1,5 +1,6 @@
 // license:GPLv3+
 #include "ControllerInput.h"
+#include "NativeButtons.h"
 
 #include <SDL3/SDL.h>
 
@@ -51,6 +52,7 @@ static SDL_JoystickID Attach(const char* name, SDL_JoystickType type, Uint16 axe
 	desc.name = name;
 	desc.type = type;
 	desc.naxes = axes;
+	desc.nbuttons = 1;
 	const auto id = SDL_AttachVirtualJoystick(&desc);
 	Check(id != 0, "Attach a virtual controller");
 	return id;
@@ -85,6 +87,24 @@ int main() {
 	input.ListAxes(gamepad.deviceIndex, axes.data(), static_cast<int>(axes.size()));
 	Check(axes[0].usagePage == VPE_GAMEPAD_AXIS_USAGE_PAGE && std::strcmp(axes[0].name, "Left Stick X") == 0,
 		"Expose standardized axis metadata");
+	VpeInputButtonInfo rawButton{};
+	VpeInputButtonInfo padButton{};
+	Check(VpeInputListDeviceButtons(pinscape.deviceIndex, &rawButton, 1) == 1 && rawButton.buttonId == 0,
+		"Expose raw joystick buttons");
+	Check(VpeInputListDeviceButtons(gamepad.deviceIndex, &padButton, 1) == 1
+		&& padButton.buttonId == SDL_GAMEPAD_BUTTON_SOUTH, "Expose standardized gamepad buttons");
+	VpeInputButtonBinding bindings[] = {{VPE_INPUT_LEFT_NUDGE, rawButton.buttonId}, {VPE_INPUT_LEFT_NUDGE, padButton.buttonId}};
+	std::snprintf(bindings[0].deviceId, sizeof(bindings[0].deviceId), "%s", pinscape.stableId);
+	std::snprintf(bindings[1].deviceId, sizeof(bindings[1].deviceId), "%s", gamepad.stableId);
+	VpeInputSetButtonBindings(bindings, 2);
+	Check(SDL_SetJoystickVirtualButton(raw, 0, true) && SDL_SetJoystickVirtualButton(pad, 0, true),
+		"Inject joystick and gamepad presses");
+	input.Poll(1100, true, callback, &observed);
+	const uint64_t nudge = uint64_t{1} << VPE_INPUT_LEFT_NUDGE;
+	Check(NativeButtons::GetState().PressedActions() == nudge, "Combine configured joystick and gamepad presses");
+	Check(SDL_SetJoystickVirtualButton(pad, 0, false), "Release the gamepad button");
+	input.Poll(1200, true, callback, &observed);
+	Check(NativeButtons::GetState().PressedActions() == nudge, "A joystick can keep the action held");
 
 	observed.events.clear();
 	Check(SDL_SetJoystickVirtualAxis(raw, 0, -32768), "Inject a raw sample");
@@ -110,6 +130,8 @@ int main() {
 	input.Poll(5000, true, callback, &observed);
 	Check(observed.Find("PinscapePico").isConnected == 0, "Remove disconnected devices before the next scan");
 	Check(input.ListAxes(pinscape.deviceIndex, nullptr, 0) == 0, "Remove the disconnected axis snapshot");
+	Check(VpeInputListDeviceButtons(pinscape.deviceIndex, nullptr, 0) == 0
+		&& NativeButtons::GetState().PressedActions() == 0, "Drop the held button when the joystick disconnects");
 	const auto newRawId = Attach("PinscapePico", SDL_JOYSTICK_TYPE_UNKNOWN, 6);
 	input.Poll(260000, true, callback, &observed);
 	const auto replacement = observed.Find("PinscapePico");
@@ -122,9 +144,11 @@ int main() {
 	input.Stop();
 	Check(input.AppendDevices(nullptr, 0, 0) == 0, "Clear the controller snapshot on stop");
 	input.Start();
-	const auto restartedId = Attach("VPE Restart", SDL_JOYSTICK_TYPE_UNKNOWN, 2);
+	const auto restartedId = Attach("VPE Restart", SDL_JOYSTICK_TYPE_UNKNOWN, 0);
 	input.Poll(270000, true, callback, &observed);
-	Check(observed.Find("VPE Restart").axisCount == 2, "Reinitialize the subsystem after stopping");
+	Check(observed.Find("VPE Restart").isConnected && observed.Find("VPE Restart").axisCount == 0,
+		"Detect button-only devices after restarting");
 	Check(SDL_DetachVirtualJoystick(restartedId), "Detach the restart fixture");
 	input.Stop();
+	VpeInputSetButtonBindings(nullptr, 0);
 }

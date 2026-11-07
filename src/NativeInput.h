@@ -150,6 +150,7 @@ typedef enum {
 #define VPE_INPUT_DEVICE_ID_SIZE 260
 #define VPE_INPUT_DEVICE_NAME_SIZE 128
 #define VPE_INPUT_AXIS_NAME_SIZE 32
+#define VPE_INPUT_BUTTON_NAME_SIZE 32
 
 // Vendor-defined metadata page for SDL's standardized gamepad axes.
 #define VPE_GAMEPAD_AXIS_USAGE_PAGE 0xff00
@@ -195,6 +196,18 @@ typedef struct {
 	int32_t _padding;
 } VpeInputBinding;
 
+typedef struct {
+	int32_t buttonId;
+	int32_t isPressed;
+	char name[VPE_INPUT_BUTTON_NAME_SIZE];
+} VpeInputButtonInfo;
+
+typedef struct {
+	int32_t action;
+	int32_t buttonId;
+	char deviceId[VPE_INPUT_DEVICE_ID_SIZE]; // UTF-8 stable ID from VpeInputListDevices
+} VpeInputButtonBinding;
+
 // Callback for input events
 typedef void (*VpeInputEventCallback)(const VpeInputEvent* event, void* userData);
 
@@ -237,6 +250,11 @@ VPE_API int VpeInputListDevices(VpeInputDeviceInfo* devices, int maxDevices);
 // List axes for a device index returned by VpeInputListDevices.
 // Returns the total available axis count. Copies up to maxAxes entries when axes is non-null.
 VPE_API int VpeInputListDeviceAxes(int deviceIndex, VpeInputAxisInfo* axes, int maxAxes);
+
+// Optional desktop extension. These mappings supplement keyboard and
+// predefined OPD mappings. Replace them atomically, even while polling.
+VPE_API void VpeInputSetButtonBindings(const VpeInputButtonBinding* bindings, int count);
+VPE_API int VpeInputListDeviceButtons(int deviceIndex, VpeInputButtonInfo* buttons, int maxButtons);
 
 // Get high-resolution timestamp in microseconds
 VPE_API int64_t VpeGetTimestampUsec(void);

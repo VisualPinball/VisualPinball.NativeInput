@@ -269,9 +269,9 @@ namespace {
 					}
 				}
 			}
+			g_controllers.Poll(timestamp, foreground, callback, userData);
 			g_input.BeginPoll(timestamp, foreground, keys);
 			transport.Poll(timestamp);
-			g_controllers.Poll(timestamp, foreground, callback, userData);
 
 			std::unique_lock<std::mutex> lock(g_waitMutex);
 			g_waitCondition.wait_for(lock, std::chrono::microseconds(g_pollIntervalUs),
@@ -305,6 +305,7 @@ VPE_API int VpeInputGetProtocolVersion(void) {
 
 VPE_API void VpeInputShutdown(void) {
 	VpeInputStopPolling();
+	VpeInputSetButtonBindings(nullptr, 0);
 	g_protocolVersionChecked.store(false, std::memory_order_release);
 	g_bindings.clear();
 

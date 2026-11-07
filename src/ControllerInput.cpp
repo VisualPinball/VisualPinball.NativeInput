@@ -1,5 +1,6 @@
 // license:GPLv3+
 #include "ControllerInput.h"
+#include "NativeButtons.h"
 
 #if defined(VPE_PLATFORM_WINDOWS)
 #define NOMINMAX
@@ -25,11 +26,44 @@
 
 namespace {
 	constexpr int64_t ScanIntervalUsec = 250000;
+	constexpr int RawGamepadButtonBase = 0x10000;
 	constexpr std::array<const char*, SDL_GAMEPAD_AXIS_COUNT> GamepadAxisNames = {
 		"Left Stick X", "Left Stick Y", "Right Stick X", "Right Stick Y", "Left Trigger", "Right Trigger"
 	};
 
 	const char* ValueOrEmpty(const char* value) { return value == nullptr ? "" : value; }
+
+	std::vector<VpeInputButtonInfo> DescribeButtons(SDL_Joystick* joystick, SDL_Gamepad* gamepad) {
+		std::vector<VpeInputButtonInfo> buttons;
+		const int rawCount = std::max(SDL_GetNumJoystickButtons(joystick), 0);
+		std::vector<bool> mapped(rawCount);
+		if (gamepad != nullptr) {
+			int count = 0;
+			std::unique_ptr<SDL_GamepadBinding*, decltype(&SDL_free)> bindings(SDL_GetGamepadBindings(gamepad, &count), SDL_free);
+			for (int i = 0; bindings && i < count; ++i) {
+				const auto& binding = *bindings.get()[i];
+				if (binding.input_type == SDL_GAMEPAD_BINDTYPE_BUTTON && binding.input.button >= 0
+					&& binding.input.button < rawCount) mapped[binding.input.button] = true;
+			}
+			for (int i = 0; i < SDL_GAMEPAD_BUTTON_COUNT; ++i) {
+				const auto id = static_cast<SDL_GamepadButton>(i);
+				if (!SDL_GamepadHasButton(gamepad, id)) continue;
+				VpeInputButtonInfo button{};
+				button.buttonId = i;
+				const auto* name = SDL_GetGamepadStringForButton(id);
+				std::snprintf(button.name, sizeof(button.name), "%s", ValueOrEmpty(name));
+				buttons.push_back(button);
+			}
+		}
+		for (int i = 0; i < rawCount; ++i) {
+			if (mapped[i]) continue;
+			VpeInputButtonInfo button{};
+			button.buttonId = gamepad == nullptr ? i : RawGamepadButtonBase + i;
+			std::snprintf(button.name, sizeof(button.name), "Button %d", i + 1);
+			buttons.push_back(button);
+		}
+		return buttons;
+	}
 
 	bool UsesPinscapeLayout(const char* name) {
 		return SDL_strncasecmp(name, "mjrnet Pinscape Controller", sizeof("mjrnet Pinscape Controller") - 1) == 0
@@ -136,6 +170,7 @@ void ControllerInput::Start() {
 void ControllerInput::Stop() {
 	{
 		std::lock_guard<std::mutex> lock(m_snapshotMutex);
+		for (const auto& device : m_devices) NativeButtons::GetState().Disconnect(device->info.deviceIndex);
 		m_devices.clear();
 	}
 	if (m_started) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
@@ -150,7 +185,9 @@ void ControllerInput::SetGameplayEnabled(bool enabled) {
 bool ControllerInput::Reconcile(int64_t timestamp) {
 	bool changed = false;
 	const auto removed = std::remove_if(m_devices.begin(), m_devices.end(), [](const auto& device) {
-		return !SDL_JoystickConnected(device->joystick);
+		if (SDL_JoystickConnected(device->joystick)) return false;
+		NativeButtons::GetState().Disconnect(device->info.deviceIndex);
+		return true;
 	});
 	if (removed != m_devices.end()) {
 		m_devices.erase(removed, m_devices.end());
@@ -221,7 +258,9 @@ bool ControllerInput::Reconcile(int64_t timestamp) {
 			}
 			device->axes.push_back(info);
 		}
-		if (device->axes.empty()) continue;
+		auto buttons = DescribeButtons(device->joystick, device->gamepad);
+		if (device->axes.empty() && buttons.empty()) continue;
+		NativeButtons::GetState().Connect(device->info.deviceIndex, stableId, std::move(buttons));
 		device->info.axisCount = static_cast<int>(device->axes.size());
 		m_devices.push_back(std::move(device));
 		changed = true;
@@ -243,6 +282,13 @@ void ControllerInput::Poll(int64_t timestamp, bool foreground, VpeInputEventCall
 		std::lock_guard<std::mutex> lock(m_snapshotMutex);
 		changed = Reconcile(timestamp);
 		for (auto& device : m_devices) {
+			NativeButtons::GetState().Update(device->info.deviceIndex, [&](const auto& button) {
+				if (device->gamepad == nullptr) return SDL_GetJoystickButton(device->joystick, button.buttonId);
+				if (button.buttonId >= RawGamepadButtonBase) {
+					return SDL_GetJoystickButton(device->joystick, button.buttonId - RawGamepadButtonBase);
+				}
+				return SDL_GetGamepadButton(device->gamepad, static_cast<SDL_GamepadButton>(button.buttonId));
+			});
 			for (auto& axis : device->axes) {
 				const auto value = device->gamepad != nullptr
 					? SDL_GetGamepadAxis(device->gamepad, static_cast<SDL_GamepadAxis>(axis.axisId))

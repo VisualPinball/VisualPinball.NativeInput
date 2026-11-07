@@ -66,6 +66,7 @@ namespace OpenPinballDevice {
 
 		uint64_t Timestamp() const { return ReadUnsigned(payload, 8); }
 		uint32_t PinballButtons() const { return static_cast<uint32_t>(ReadUnsigned(payload + 12, 4)); }
+		uint32_t GenericButtons() const { return static_cast<uint32_t>(ReadUnsigned(payload + 8, 4)); }
 
 		bool TryReadAxis(const Axis& axis, float& value) const {
 			if (axis.offset + 2 > size) return false;

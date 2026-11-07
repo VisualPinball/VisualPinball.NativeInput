@@ -160,6 +160,8 @@ Some Nintendo controllers change their report format when SDL opens them. On Win
 
 Controller mappings use serial numbers and physical paths where available. When the platform exposes identical devices without a physical identity, the mappings use slots for that model. Recheck those slots after changing the connection order of identical controllers.
 
+The Player's Nudge settings can bind joystick, gamepad, or generic OPD buttons to left, right, and forward nudge, Tilt, and Slam Tilt. Custom buttons supplement keyboard and predefined OPD buttons. Bindings follow the device ID and button ID across polling sessions. Tilt uses the table's physical Tilt Bob routing.
+
 ## Performance
 
 - **Latency**: <0.1ms from physical input to event callback
@@ -169,7 +171,7 @@ Controller mappings use serial numbers and physical paths where available. When 
 
 ## Future Enhancements
 
-1. **Controller buttons**: Configurable joystick, gamepad, and generic OPD button bindings
+1. **Controller buttons**: Configurable bindings for other gameplay actions
 2. **Force feedback**: Haptics for nudge, tilt, button feedback
 3. **Configuration**: JSON-based key mapping files
 4. **Profiles**: Per-table input profiles

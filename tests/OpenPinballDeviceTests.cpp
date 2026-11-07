@@ -118,12 +118,72 @@ static void CheckPollingState() {
 	Check(input.ListDevices(nullptr, 0) == 0, "Clear snapshots when polling stops");
 }
 
+static void CheckGenericButtons() {
+	Input input;
+	std::vector<VpeInputEvent> actions;
+	input.Start([](const VpeInputEvent* event, void* data) {
+		if (event->eventType == VPE_INPUT_EVENT_ACTION) {
+			static_cast<std::vector<VpeInputEvent>*>(data)->push_back(*event);
+		}
+	}, &actions);
+	const int first = input.Connect("mapped", "OPD", {5, 71, 28}, 0);
+	const int other = input.Connect("other", "OPD", {5, 71, 28}, 0);
+	VpeInputButtonInfo buttons[32]{};
+	Check(VpeInputListDeviceButtons(first, buttons, 32) == 32 && buttons[31].buttonId == 31
+		&& std::strcmp(buttons[31].name, "Generic Button 32") == 0, "Expose one-based OPD button labels");
+
+	const VpeInputButtonBinding binding{VPE_INPUT_TILT, 31, "mapped"};
+	VpeInputSetButtonBindings(&binding, 1);
+	Keys keys{};
+	input.BeginPoll(10, true, keys);
+	unsigned char report[29]{};
+	report[0] = 5;
+	report[12] = 0x80; // Generic button 32, separate from predefined buttons.
+	input.Receive(other, report, sizeof(report), 20);
+	Check(actions.empty(), "Do not use the same button number on another device");
+	input.Receive(first, report, sizeof(report), 20);
+	Check(actions.size() == 1 && actions.back().action == VPE_INPUT_TILT && actions.back().value == 1,
+		"Route the selected generic OPD button");
+	Check(VpeInputListDeviceButtons(first, buttons, 32) == 32 && buttons[31].isPressed,
+		"Expose the generic button level");
+
+	keys[VPE_INPUT_TILT] = true;
+	input.BeginPoll(30, true, keys);
+	report[12] = 0;
+	report[14] = 0x80; // Predefined physical tilt replaces the held generic button.
+	input.Receive(first, report, sizeof(report), 30);
+	keys[VPE_INPUT_TILT] = false;
+	input.BeginPoll(40, true, keys);
+	Check(actions.size() == 1, "Combine generic, predefined and keyboard tilt without a spurious release");
+	report[14] = 0;
+	input.Receive(first, report, sizeof(report), 40);
+	Check(actions.size() == 2 && actions.back().value == 0, "Release only when all tilt sources release");
+
+	input.SetGameplayEnabled(0);
+	report[12] = 0x80;
+	input.Receive(first, report, sizeof(report), 50);
+	input.SetGameplayEnabled(1);
+	input.BeginPoll(60, true, keys);
+	Check(actions.size() == 2, "Ignore a generic button pressed during pause");
+	report[12] = 0;
+	input.Receive(first, report, sizeof(report), 60);
+	report[12] = 0x80;
+	input.Receive(first, report, sizeof(report), 60);
+	Check(actions.size() == 3 && actions.back().value == 1, "Re-arm after the button releases");
+	input.Disconnect(first, 70);
+	Check(actions.size() == 4 && actions.back().value == 0 && VpeInputListDeviceButtons(first, nullptr, 0) == 0,
+		"Release the action and clear button metadata on unplug");
+	VpeInputSetButtonBindings(nullptr, 0);
+	input.Stop();
+}
+
 int main() {
 	CheckDescriptor();
 	Check(CheckUsbString("OpenPinballDeviceStruct/1.0"), "Read the signature in the advertised USB language");
 	Check(!CheckUsbString("OpenPinballDeviceStruct/1.0", true), "Reject a truncated USB string");
 	Check(!CheckUsbString("OpenPinballDeviceStruct/2.0"), "Reject an incompatible USB signature");
 	CheckPollingState();
+	CheckGenericButtons();
 
 	Check(SupportsVersion(L"OpenPinballDeviceStruct/1.0"), "Recognize the Pico signature");
 	Check(SupportsVersion(L"OpenPinballDeviceStruct/1.12"), "Accept a future minor version");

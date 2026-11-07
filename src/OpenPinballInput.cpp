@@ -1,5 +1,6 @@
 // license:GPLv3+
 #include "OpenPinballInput.h"
+#include "NativeButtons.h"
 
 #include <cstdio>
 
@@ -13,6 +14,7 @@ namespace OpenPinballDevice {
 
 	void Input::Stop() {
 		std::lock_guard<std::mutex> lock(m_snapshotMutex);
+		for (const auto& device : m_devices) NativeButtons::GetState().Disconnect(device.info.deviceIndex);
 		m_devices.clear();
 	}
 
@@ -53,6 +55,7 @@ namespace OpenPinballDevice {
 
 		{
 			std::lock_guard<std::mutex> lock(m_snapshotMutex);
+			NativeButtons::GetState().Connect(device.info.deviceIndex, stableId, NativeButtons::OpdGenericButtons());
 			m_devices.push_back(device);
 		}
 		Emit({timestamp, VPE_INPUT_EVENT_DEVICES_CHANGED});
@@ -66,6 +69,7 @@ namespace OpenPinballDevice {
 				return item.info.deviceIndex == deviceIndex;
 			});
 			if (device == m_devices.end()) return;
+			NativeButtons::GetState().Disconnect(deviceIndex);
 			m_devices.erase(device);
 		}
 		PublishActions(timestamp);
@@ -91,7 +95,8 @@ namespace OpenPinballDevice {
 				: Report::ReadPayload(bytes, size, report);
 			if (!valid) return;
 
-			buttonsChanged = device->buttons != report.PinballButtons();
+			const bool genericChanged = NativeButtons::UpdateOpdGenericButtons(deviceIndex, report.GenericButtons());
+			buttonsChanged = genericChanged || device->buttons != report.PinballButtons();
 			device->buttons = report.PinballButtons();
 			int64_t sample;
 			if (device->clock.Translate(report.Timestamp(), timestamp, sample)) {
@@ -135,8 +140,10 @@ namespace OpenPinballDevice {
 		// Managed input starts dropping events after it disables this gate.
 		std::lock_guard<std::mutex> lock(m_gameplayMutex);
 		const bool enabled = m_gate == Gate::Unconfigured || (m_foreground && m_gate == Gate::Enabled);
+		uint64_t configurable = 0;
 		Keys pressed{};
 		if (m_foreground || m_gate != Gate::Unconfigured) {
+			configurable = NativeButtons::GetState().PressedActions();
 			pressed = m_keys;
 			uint32_t buttons = 0;
 			// Device state only changes on this thread. Snapshot readers never
@@ -148,7 +155,8 @@ namespace OpenPinballDevice {
 		}
 		for (int action = 0; action < VPE_INPUT_MAX; ++action) {
 			bool value;
-			if (m_actions[action].Update(pressed[action], enabled, value)) {
+			const bool down = pressed[action] || (configurable & (uint64_t{1} << action)) != 0;
+			if (m_actions[action].Update(down, enabled, value)) {
 				Emit({timestamp, VPE_INPUT_EVENT_ACTION, action, 0, 0, value ? 1.0f : 0.0f});
 			}
 		}

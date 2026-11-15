@@ -71,7 +71,9 @@ jobs:
         include:
           - { os: windows-2022, rid: win-x64, platform: windows, arch: x64 }
           - { os: windows-2022, rid: win-x86, platform: windows, arch: x86 }
-          - { os: ubuntu-latest, rid: linux-x64, platform: linux, arch: x64 }
+          # not ubuntu-latest: a library built against a newer glibc (2.43 on 26.04) doesn't load on the
+          # systems the player supports (glibc 2.39, Ubuntu 24.04)
+          - { os: ubuntu-24.04, rid: linux-x64, platform: linux, arch: x64 }
           - { os: macos-15, rid: osx-x64, platform: macos, arch: x64 }
           - { os: macos-15, rid: osx-arm64, platform: macos, arch: arm64 }
     steps:

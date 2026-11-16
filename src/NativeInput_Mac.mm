@@ -211,7 +211,25 @@ namespace {
 		}
 	}
 
+	bool DeviceModifierMask(CGKeyCode nativeKeyCode, CGEventFlags* mask) {
+		switch (nativeKeyCode) {
+			case 59: *mask = 0x00000001; return true;
+			case 56: *mask = 0x00000002; return true;
+			case 60: *mask = 0x00000004; return true;
+			case 55: *mask = 0x00000008; return true;
+			case 54: *mask = 0x00000010; return true;
+			case 58: *mask = 0x00000020; return true;
+			case 61: *mask = 0x00000040; return true;
+			case 62: *mask = 0x00002000; return true;
+			default: return false;
+		}
+	}
+
 	bool IsPressed(CGKeyCode nativeKeyCode) {
+		CGEventFlags mask;
+		if (DeviceModifierMask(nativeKeyCode, &mask)) {
+			return (CGEventSourceFlagsState(kCGEventSourceStateCombinedSessionState) & mask) != 0;
+		}
 		return CGEventSourceKeyState(kCGEventSourceStateCombinedSessionState, nativeKeyCode);
 	}
 

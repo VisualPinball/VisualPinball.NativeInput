@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 
 static void Check(bool condition, const char* message) {
@@ -61,13 +62,34 @@ static SDL_JoystickID Attach(const char* name, SDL_JoystickType type, Uint16 axe
 
 int main() {
 	const int newDeviceIndex = 77;
-	VpeInputButtonInfo button{0, 0, "Button 1"};
-	NativeButtons::GetState().Connect(newDeviceIndex, "new-board", {button});
-	Check(VpeInputListDeviceButtons(newDeviceIndex, &button, 1) == 1, "List button metadata before the first report");
-	Check(VpeInputReadDeviceButtons(newDeviceIndex, &button, 1) == 0, "Do not report a fabricated release before the first report");
-	NativeButtons::GetState().Update(newDeviceIndex, [](const auto&) { return true; });
-	Check(VpeInputReadDeviceButtons(newDeviceIndex, &button, 1) == 1 && button.isPressed,
-		"Read the held button after the first report");
+	std::array<VpeInputButtonInfo, 2> newButtons{{{0, 0, "Button 1"}, {1, 0, "Button 2"}}};
+	NativeButtons::GetState().Connect(newDeviceIndex, "new-board", {newButtons[0], newButtons[1]}, {0});
+	Check(VpeInputListDeviceButtons(newDeviceIndex, newButtons.data(), 2) == 2, "List button metadata before the first report");
+	VpeInputStartControlCapture(1);
+	NativeButtons::GetState().Update(newDeviceIndex, [](const auto&) -> std::optional<bool> { return std::nullopt; },
+		[](int, float) { return .25f; });
+	Check(VpeInputReadDeviceButtons(newDeviceIndex, newButtons.data(), 2) == 0, "An axis-only report does not sample buttons");
+	const auto sampleButton = [&](int id, bool pressed) {
+		NativeButtons::GetState().Update(newDeviceIndex, [&](const auto& button) -> std::optional<bool> {
+			if (button.buttonId != id) return std::nullopt;
+			return pressed;
+		});
+	};
+	sampleButton(0, true);
+	Check(VpeInputReadDeviceButtons(newDeviceIndex, newButtons.data(), 2) == 0, "Wait for all button reports");
+	sampleButton(1, true);
+	Check(VpeInputReadDeviceButtons(newDeviceIndex, newButtons.data(), 2) == 2
+		&& newButtons[0].isPressed && newButtons[1].isPressed, "Combine button levels from separate reports");
+	sampleButton(1, false);
+	Check(VpeInputReadDeviceButtons(newDeviceIndex, newButtons.data(), 2) == 2
+		&& newButtons[0].isPressed && !newButtons[1].isPressed, "Keep the last level of buttons outside the current report");
+	VpeInputControlBinding capturedButton{};
+	Check(VpeInputReadControlCapture(&capturedButton, 1) == 0, "A held button is not captured on its first sample");
+	sampleButton(1, true);
+	sampleButton(1, false);
+	Check(VpeInputReadControlCapture(&capturedButton, 1) == 1 && capturedButton.controlId == 1
+		&& capturedButton.kind == VPE_CONTROL_BUTTON, "Capture a new press after that button has been sampled");
+	VpeInputStartControlCapture(0);
 	NativeButtons::GetState().Disconnect(newDeviceIndex);
 
 	ControllerInput input;
@@ -124,6 +146,37 @@ int main() {
 	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MIN), "Release the trigger again");
 	input.Poll(1030, true, callback, &observed);
 	Check(!triggerPressed(), "The trigger returns to up");
+
+	VpeInputStartControlCapture(2);
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MAX), "Pull one trigger for capture");
+	input.Poll(1040, true, callback, &observed);
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MIN), "Release the single trigger");
+	input.Poll(1050, true, callback, &observed);
+	VpeInputControlBinding triggerCombo[8]{};
+	Check(VpeInputReadControlCapture(triggerCombo, 8) == 0, "A trigger alone does not count as a combo");
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MAX)
+		&& SDL_SetJoystickVirtualButton(pad, 0, true), "Pull a trigger and press a button for a combo");
+	input.Poll(1060, true, callback, &observed);
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MIN)
+		&& SDL_SetJoystickVirtualButton(pad, 0, false), "Release the trigger combo");
+	input.Poll(1070, true, callback, &observed);
+	Check(VpeInputReadControlCapture(triggerCombo, 8) == 2
+		&& triggerCombo[0].kind == VPE_CONTROL_BUTTON && triggerCombo[0].controlId == padButton.buttonId
+		&& triggerCombo[1].kind == VPE_CONTROL_BUTTON && triggerCombo[1].controlId == leftTrigger,
+		"Capture the trigger and button without a duplicate axis");
+	triggerCombo[0].action = triggerCombo[1].action = VPE_INPUT_START;
+	VpeInputSetControlBindings(triggerCombo, 2);
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MAX), "Pull the mapped trigger");
+	input.Poll(1080, true, callback, &observed);
+	Check(NativeButtons::GetState().PressedActions() == 0, "A mapped trigger combo requires both controls");
+	Check(SDL_SetJoystickVirtualButton(pad, 0, true), "Complete the mapped trigger combo");
+	input.Poll(1090, true, callback, &observed);
+	Check(NativeButtons::GetState().PressedActions() == (uint64_t{1} << VPE_INPUT_START),
+		"Use the captured trigger combo for a gameplay action");
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MIN)
+		&& SDL_SetJoystickVirtualButton(pad, 0, false), "Restore the virtual gamepad to rest");
+	input.Poll(1095, true, callback, &observed);
+
 	VpeInputButtonBinding bindings[] = {{VPE_INPUT_LEFT_NUDGE, rawButton.buttonId}, {VPE_INPUT_LEFT_NUDGE, padButton.buttonId}};
 	std::snprintf(bindings[0].deviceId, sizeof(bindings[0].deviceId), "%s", pinscape.stableId);
 	std::snprintf(bindings[1].deviceId, sizeof(bindings[1].deviceId), "%s", gamepad.stableId);

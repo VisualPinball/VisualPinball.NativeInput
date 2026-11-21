@@ -290,7 +290,10 @@ bool ControllerInput::Reconcile(int64_t timestamp) {
 		if (device->axes.empty() && buttons.empty()) continue;
 		std::vector<int> axisIds;
 		for (const auto& axis : device->axes) axisIds.push_back(axis.axisId);
-		NativeButtons::GetState().Connect(device->info.deviceIndex, stableId, std::move(buttons), axisIds);
+		// Keep both trigger axes available to analog mappings, but capture their button representation once.
+		const std::vector<int> buttonBackedAxes = standardized
+			? std::vector<int>{SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER} : std::vector<int>{};
+		NativeButtons::GetState().Connect(device->info.deviceIndex, stableId, std::move(buttons), axisIds, buttonBackedAxes);
 		device->info.axisCount = static_cast<int>(device->axes.size());
 		m_devices.push_back(std::move(device));
 		changed = true;

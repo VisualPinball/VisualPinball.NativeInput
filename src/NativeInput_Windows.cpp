@@ -65,6 +65,7 @@ namespace {
 	struct HatDescriptor {
 		HIDP_VALUE_CAPS caps;
 		uint8_t directions = 0;
+		bool sampledThisReport = false;
 	};
 
 	struct HidDevice {
@@ -745,8 +746,10 @@ namespace {
 		constexpr uint8_t directions[] = {1, 3, 2, 6, 4, 12, 8, 9}; // clockwise from up
 		for (auto& hat : device.hats) {
 			ULONG value = 0;
-			if (HidP_GetUsageValue(HidP_Input, UsagePageGenericDesktop, hat.caps.LinkCollection, UsageHat,
-				&value, device.preparsedData, report, reportLength) != HIDP_STATUS_SUCCESS) continue;
+			hat.sampledThisReport = hat.caps.ReportID == device.inputReport[0]
+				&& HidP_GetUsageValue(HidP_Input, UsagePageGenericDesktop, hat.caps.LinkCollection, UsageHat,
+					&value, device.preparsedData, report, reportLength) == HIDP_STATUS_SUCCESS;
+			if (!hat.sampledThisReport) continue;
 			const auto offset = static_cast<int64_t>(value) - hat.caps.LogicalMin;
 			const auto range = static_cast<int64_t>(hat.caps.LogicalMax) - hat.caps.LogicalMin + 1;
 			hat.directions = 0;
@@ -831,14 +834,15 @@ namespace {
 			else axis.samplePending = true;
 		}
 		auto bindingAxis = device.axes.begin();
-		const bool controlsChanged = NativeButtons::GetState().Update(device.deviceIndex, [&](const auto& button) {
+		const bool controlsChanged = NativeButtons::GetState().Update(device.deviceIndex, [&](const auto& button) -> std::optional<bool> {
 			if (button.buttonId >= HatButtonBase) {
 				const int offset = button.buttonId - HatButtonBase;
-				return (device.hats[offset / 4].directions & (1 << (offset % 4))) != 0;
+				const auto& hat = device.hats[offset / 4];
+				if (!hat.sampledThisReport) return std::nullopt;
+				return (hat.directions & (1 << (offset % 4))) != 0;
 			}
-			// Reports for other IDs leave these button levels untouched.
-			return buttonsRead && device.buttonReportIds[button.buttonId] == device.inputReport[0]
-				? device.pressedDataIndices[button.buttonId] != 0 : button.isPressed != 0;
+			if (!buttonsRead || device.buttonReportIds[button.buttonId] != device.inputReport[0]) return std::nullopt;
+			return device.pressedDataIndices[button.buttonId] != 0;
 		}, [&](int, float) { return (bindingAxis++)->bindingValue; });
 		if (controlsChanged) CaptureButtons(timestampUsec, buttons);
 	}

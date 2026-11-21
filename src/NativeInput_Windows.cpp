@@ -1118,8 +1118,10 @@ VPE_API int VpeInputStartPolling(VpeInputEventCallback callback, void* userData,
 	{
 		std::lock_guard<std::mutex> lock(g_bindingsMutex);
 		AddOpdBindings();
-		for (auto& binding : g_bindings) {
-			binding.latch = {};
+		// A controller-only action needs a latch even when it has no key or OPD mapping.
+		g_bindings.reserve(VPE_INPUT_MAX);
+		for (int action = 0; action < VPE_INPUT_MAX; ++action) {
+			GetBinding(static_cast<VpeInputAction>(action)).latch = {};
 		}
 	}
 	if (g_stopEvent != NULL) {

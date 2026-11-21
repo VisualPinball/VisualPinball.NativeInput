@@ -60,6 +60,16 @@ static SDL_JoystickID Attach(const char* name, SDL_JoystickType type, Uint16 axe
 }
 
 int main() {
+	const int newDeviceIndex = 77;
+	VpeInputButtonInfo button{0, 0, "Button 1"};
+	NativeButtons::GetState().Connect(newDeviceIndex, "new-board", {button});
+	Check(VpeInputListDeviceButtons(newDeviceIndex, &button, 1) == 1, "List button metadata before the first report");
+	Check(VpeInputReadDeviceButtons(newDeviceIndex, &button, 1) == 0, "Do not report a fabricated release before the first report");
+	NativeButtons::GetState().Update(newDeviceIndex, [](const auto&) { return true; });
+	Check(VpeInputReadDeviceButtons(newDeviceIndex, &button, 1) == 1 && button.isPressed,
+		"Read the held button after the first report");
+	NativeButtons::GetState().Disconnect(newDeviceIndex);
+
 	ControllerInput input;
 	input.Start();
 	Observed observed{input};
@@ -94,8 +104,26 @@ int main() {
 		&& std::strcmp(rawButtons[1].name, "Hat 1 Up") == 0 && std::strcmp(rawButtons[2].name, "Hat 1 Right") == 0,
 		"Expose raw joystick buttons and POV directions");
 	const auto rawButton = rawButtons[0];
-	Check(VpeInputListDeviceButtons(gamepad.deviceIndex, &padButton, 1) == 1
+	Check(VpeInputListDeviceButtons(gamepad.deviceIndex, &padButton, 1) >= 1
 		&& padButton.buttonId == SDL_GAMEPAD_BUTTON_SOUTH, "Expose standardized gamepad buttons");
+	constexpr int leftTrigger = 0x30000;
+	const auto triggerPressed = [&]() {
+		std::array<VpeInputButtonInfo, 16> buttons{};
+		const int count = VpeInputReadDeviceButtons(gamepad.deviceIndex, buttons.data(), static_cast<int>(buttons.size()));
+		const auto end = buttons.begin() + std::min(count, static_cast<int>(buttons.size()));
+		const auto match = std::find_if(buttons.begin(), end, [leftTrigger](const auto& button) { return button.buttonId == leftTrigger; });
+		Check(match != end, "Advertise the gamepad left trigger as a bindable button");
+		return match->isPressed != 0;
+	};
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MIN), "Release the trigger");
+	input.Poll(1010, true, callback, &observed);
+	Check(!triggerPressed(), "The released trigger is up");
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MAX), "Press the trigger");
+	input.Poll(1020, true, callback, &observed);
+	Check(triggerPressed(), "The pressed trigger is down");
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, SDL_JOYSTICK_AXIS_MIN), "Release the trigger again");
+	input.Poll(1030, true, callback, &observed);
+	Check(!triggerPressed(), "The trigger returns to up");
 	VpeInputButtonBinding bindings[] = {{VPE_INPUT_LEFT_NUDGE, rawButton.buttonId}, {VPE_INPUT_LEFT_NUDGE, padButton.buttonId}};
 	std::snprintf(bindings[0].deviceId, sizeof(bindings[0].deviceId), "%s", pinscape.stableId);
 	std::snprintf(bindings[1].deviceId, sizeof(bindings[1].deviceId), "%s", gamepad.stableId);
@@ -139,6 +167,24 @@ int main() {
 		makeBinding(VPE_INPUT_SLAM_TILT, 0, VPE_CONTROL_BUTTON, rawButtons[1].buttonId, 0, pinscape.stableId),
 		makeBinding(VPE_INPUT_SLAM_TILT, 0, VPE_CONTROL_AXIS_ABOVE, 0, .5f, gamepad.stableId),
 	};
+	const VpeInputControlBinding gameplay[] = {
+		makeBinding(VPE_INPUT_UPPER_LEFT_FLIPPER, 0, VPE_CONTROL_BUTTON, rawButton.buttonId, 0, pinscape.stableId),
+		makeBinding(VPE_INPUT_START, 0, VPE_CONTROL_BUTTON, padButton.buttonId, 0, gamepad.stableId),
+		makeBinding(VPE_INPUT_PLUNGE, 0, VPE_CONTROL_AXIS_ABOVE, 0, .1f, gamepad.stableId),
+	};
+	VpeInputSetControlBindings(gameplay, 3);
+	Check(SDL_SetJoystickVirtualButton(pad, 0, true), "Press Start on the virtual gamepad");
+	input.Poll(4020, true, callback, &observed);
+	const uint64_t flipper = uint64_t{1} << VPE_INPUT_UPPER_LEFT_FLIPPER;
+	const uint64_t start = uint64_t{1} << VPE_INPUT_START;
+	Check(NativeButtons::GetState().PressedActions() == (flipper | start),
+		"Map the joystick flipper and gamepad Start to gameplay actions");
+	Check(SDL_SetJoystickVirtualButton(pad, 0, false), "Release Start");
+	Check(SDL_SetJoystickVirtualAxis(pad, SDL_GAMEPAD_AXIS_LEFTX, 16384), "Move the gamepad stick");
+	input.Poll(4050, true, callback, &observed);
+	Check(NativeButtons::GetState().PressedActions() == flipper,
+		"Release Start independently; ordinary gameplay actions do not accept axis thresholds");
+
 	VpeInputSetControlBindings(controls, 4);
 	Check(SDL_SetJoystickVirtualAxis(pad, 0, 24576) && SDL_SetJoystickVirtualHat(raw, 0, SDL_HAT_RIGHTUP),
 		"Inject a stick and diagonal POV combination");

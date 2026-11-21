@@ -19,7 +19,7 @@ namespace NativeButtons {
 		void ConfigureControls(const VpeInputControlBinding* controls, int count);
 		void StartCapture(int mode);
 		int ReadCapture(VpeInputControlBinding* controls, int maxControls);
-		int List(int deviceIndex, VpeInputButtonInfo* buttons, int maxButtons);
+		int List(int deviceIndex, VpeInputButtonInfo* buttons, int maxButtons, bool requireSample = false);
 		uint64_t PressedActions();
 
 		template <typename Sample>

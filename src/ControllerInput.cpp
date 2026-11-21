@@ -28,6 +28,7 @@ namespace {
 	constexpr int64_t ScanIntervalUsec = 250000;
 	constexpr int RawGamepadButtonBase = 0x10000;
 	constexpr int HatButtonBase = 0x20000;
+	constexpr int TriggerButtonBase = 0x30000;
 	constexpr std::array<Uint8, 4> HatDirections = {SDL_HAT_UP, SDL_HAT_RIGHT, SDL_HAT_DOWN, SDL_HAT_LEFT};
 	constexpr std::array<const char*, SDL_GAMEPAD_AXIS_COUNT> GamepadAxisNames = {
 		"Left Stick X", "Left Stick Y", "Right Stick X", "Right Stick Y", "Left Trigger", "Right Trigger"
@@ -59,6 +60,14 @@ namespace {
 				button.buttonId = i;
 				const auto* name = SDL_GetGamepadStringForButton(id);
 				std::snprintf(button.name, sizeof(button.name), "%s", ValueOrEmpty(name));
+				buttons.push_back(button);
+			}
+			for (int trigger = 0; trigger < 2; ++trigger) {
+				const auto axis = static_cast<SDL_GamepadAxis>(SDL_GAMEPAD_AXIS_LEFT_TRIGGER + trigger);
+				if (!SDL_GamepadHasAxis(gamepad, axis)) continue;
+				VpeInputButtonInfo button{};
+				button.buttonId = TriggerButtonBase + trigger;
+				std::snprintf(button.name, sizeof(button.name), "%s", GamepadAxisNames[axis]);
 				buttons.push_back(button);
 			}
 		}
@@ -316,6 +325,10 @@ void ControllerInput::Poll(int64_t timestamp, bool foreground, VpeInputEventCall
 			}
 			auto axis = device->axes.begin();
 			NativeButtons::GetState().Update(device->info.deviceIndex, [&](const auto& button) {
+				if (button.buttonId == TriggerButtonBase || button.buttonId == TriggerButtonBase + 1) {
+					const auto axis = static_cast<SDL_GamepadAxis>(SDL_GAMEPAD_AXIS_LEFT_TRIGGER + button.buttonId - TriggerButtonBase);
+					return SDL_GetGamepadAxis(device->gamepad, axis) >= (button.isPressed ? 12000 : 18000);
+				}
 				if (button.buttonId >= HatButtonBase) {
 					const auto offset = static_cast<size_t>(button.buttonId - HatButtonBase);
 					const auto hat = SDL_GetJoystickHat(device->joystick, static_cast<int>(offset / HatDirections.size()));

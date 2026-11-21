@@ -67,7 +67,7 @@ namespace NativeButtons {
 		bool hasAxisBindings = false;
 		for (int i = 0; controls != nullptr && i < count; ++i) {
 			const auto& control = controls[i];
-			if (!IsNudgeOrTilt(control.action) || control.group < 0) continue;
+			if (control.action < 0 || control.action >= VPE_INPUT_MAX || control.group < 0) continue;
 			auto group = std::find_if(groups.begin(), groups.end(), [&](const Binding& binding) {
 				return binding.action == control.action && binding.group == control.group;
 			});
@@ -81,6 +81,7 @@ namespace NativeButtons {
 			// Reject the entire group if any member is malformed.
 			return std::any_of(group.controls.begin(), group.controls.end(), [](const auto& member) {
 				const auto& control = member.control;
+				if (control.kind != VPE_CONTROL_BUTTON && !IsNudgeOrTilt(control.action)) return true;
 				const bool validThreshold = control.kind == VPE_CONTROL_BUTTON
 					|| (control.kind == VPE_CONTROL_AXIS_ABOVE && control.threshold > 0.0f)
 					|| (control.kind == VPE_CONTROL_AXIS_BELOW && control.threshold < 0.0f);
@@ -150,10 +151,11 @@ namespace NativeButtons {
 		m_captureCandidates.clear();
 	}
 
-	int State::List(int deviceIndex, VpeInputButtonInfo* buttons, int maxButtons) {
+	int State::List(int deviceIndex, VpeInputButtonInfo* buttons, int maxButtons, bool requireSample) {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		for (const auto& device : m_devices) {
 			if (device.index != deviceIndex) continue;
+			if (requireSample && !device.buttonsSampled) return 0;
 			const int count = static_cast<int>(device.buttons.size());
 			if (buttons != nullptr && maxButtons > 0) std::copy_n(device.buttons.begin(), std::min(count, maxButtons), buttons);
 			return count;
@@ -234,6 +236,10 @@ extern "C" {
 
 	VPE_API int VpeInputListDeviceButtons(int deviceIndex, VpeInputButtonInfo* buttons, int maxButtons) {
 		return NativeButtons::GetState().List(deviceIndex, buttons, maxButtons);
+	}
+
+	VPE_API int VpeInputReadDeviceButtons(int deviceIndex, VpeInputButtonInfo* buttons, int maxButtons) {
+		return NativeButtons::GetState().List(deviceIndex, buttons, maxButtons, true);
 	}
 
 	VPE_API void VpeInputSetControlBindings(const VpeInputControlBinding* controls, int count) {

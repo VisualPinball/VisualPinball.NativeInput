@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,7 +14,7 @@ namespace NativeButtons {
 	class State {
 	public:
 		void Connect(int deviceIndex, const std::string& stableId, std::vector<VpeInputButtonInfo> buttons,
-			const std::vector<int>& axisIds = {});
+			const std::vector<int>& axisIds = {}, const std::vector<int>& buttonBackedAxes = {});
 		void Disconnect(int deviceIndex);
 		void Configure(const VpeInputButtonBinding* bindings, int count);
 		void ConfigureControls(const VpeInputControlBinding* controls, int count);
@@ -33,20 +34,25 @@ namespace NativeButtons {
 			for (auto& device : m_devices) {
 				if (device.index != deviceIndex) continue;
 				bool changed = false;
-				for (auto& button : device.buttons) {
-					const bool pressed = sampleButton(button);
+				for (size_t i = 0; i < device.buttons.size(); ++i) {
+					auto& button = device.buttons[i];
+					const std::optional<bool> pressed = sampleButton(button);
+					if (!pressed.has_value()) continue;
 					const bool wasPressed = button.isPressed != 0;
-					changed |= pressed != wasPressed;
-					if (m_captureMode && device.buttonsSampled && pressed && !wasPressed)
+					changed |= *pressed != wasPressed;
+					if (m_captureMode && device.buttonSampled[i] && *pressed && !wasPressed)
 						CaptureCandidate(device.id, VPE_CONTROL_BUTTON, button.buttonId, 0.0f);
-					button.isPressed = pressed;
+					button.isPressed = *pressed;
+					if (!device.buttonSampled[i]) {
+						device.buttonSampled[i] = true;
+						--device.unsampledButtons;
+					}
 				}
-				device.buttonsSampled = true;
 				for (auto& axis : device.axes) {
 					const float value = sampleAxis(axis.id, axis.value);
 					changed |= m_hasAxisBindings && value != axis.value
 						&& (std::isfinite(value) || std::isfinite(axis.value));
-					if (m_captureMode && std::isfinite(axis.value)) {
+					if (m_captureMode && !axis.buttonBacked && std::isfinite(axis.value)) {
 						if (value >= CaptureThreshold && axis.value < CaptureThreshold)
 							CaptureCandidate(device.id, VPE_CONTROL_AXIS_ABOVE, axis.id, CaptureThreshold);
 						if (value <= -CaptureThreshold && axis.value > -CaptureThreshold)
@@ -65,6 +71,7 @@ namespace NativeButtons {
 
 		struct Axis {
 			int id;
+			bool buttonBacked;
 			float value = std::numeric_limits<float>::quiet_NaN();
 		};
 
@@ -73,7 +80,8 @@ namespace NativeButtons {
 			std::string id;
 			std::vector<VpeInputButtonInfo> buttons;
 			std::vector<Axis> axes;
-			bool buttonsSampled = false;
+			std::vector<bool> buttonSampled;
+			size_t unsampledButtons;
 		};
 
 		struct Binding {

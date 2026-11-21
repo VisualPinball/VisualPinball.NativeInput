@@ -28,10 +28,15 @@ namespace NativeButtons {
 	}
 
 	void State::Connect(int deviceIndex, const std::string& stableId, std::vector<VpeInputButtonInfo> buttons,
-		const std::vector<int>& axisIds) {
+		const std::vector<int>& axisIds, const std::vector<int>& buttonBackedAxes) {
 		if (buttons.empty() && axisIds.empty()) return;
-		Device device{deviceIndex, stableId.substr(0, VPE_INPUT_DEVICE_ID_SIZE - 1), std::move(buttons), {}};
-		for (int id : axisIds) device.axes.push_back({id});
+		const size_t buttonCount = buttons.size();
+		Device device{deviceIndex, stableId.substr(0, VPE_INPUT_DEVICE_ID_SIZE - 1), std::move(buttons), {},
+			std::vector<bool>(buttonCount, false), buttonCount};
+		for (int id : axisIds) {
+			const bool buttonBacked = std::find(buttonBackedAxes.begin(), buttonBackedAxes.end(), id) != buttonBackedAxes.end();
+			device.axes.push_back({id, buttonBacked});
+		}
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_devices.push_back(std::move(device));
 	}
@@ -155,7 +160,7 @@ namespace NativeButtons {
 		std::lock_guard<std::mutex> lock(m_mutex);
 		for (const auto& device : m_devices) {
 			if (device.index != deviceIndex) continue;
-			if (requireSample && !device.buttonsSampled) return 0;
+			if (requireSample && device.unsampledButtons != 0) return 0;
 			const int count = static_cast<int>(device.buttons.size());
 			if (buttons != nullptr && maxButtons > 0) std::copy_n(device.buttons.begin(), std::min(count, maxButtons), buttons);
 			return count;

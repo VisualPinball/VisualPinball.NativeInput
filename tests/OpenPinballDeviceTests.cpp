@@ -124,6 +124,22 @@ static void CheckPollingState() {
 	input.Receive(first, report, sizeof(report), 50);
 	Check(events.size() == 8 && events[2].eventType == VPE_INPUT_EVENT_AXIS && events[2].value == .5f,
 		"Resume OPD axis callbacks when gameplay resumes");
+	events.clear();
+	// Keep the device timestamp unchanged to test button events without axis samples.
+	report[14] = 0x08; // Left upper flipper, bit 11.
+	input.Receive(first, report, sizeof(report), 60);
+	report[14] |= 0x10; // Right upper flipper, bit 12.
+	input.Receive(first, report, sizeof(report), 70);
+	report[14] = 0x10;
+	input.Receive(first, report, sizeof(report), 80);
+	report[14] = 0;
+	input.Receive(first, report, sizeof(report), 90);
+	Check(events.size() == 4
+		&& events[0].action == VPE_INPUT_UPPER_LEFT_FLIPPER && events[0].value == 1
+		&& events[1].action == VPE_INPUT_UPPER_RIGHT_FLIPPER && events[1].value == 1
+		&& events[2].action == VPE_INPUT_UPPER_LEFT_FLIPPER && events[2].value == 0
+		&& events[3].action == VPE_INPUT_UPPER_RIGHT_FLIPPER && events[3].value == 0,
+		"Route and release both upper flipper switches");
 	input.Stop();
 	Check(input.ListDevices(nullptr, 0) == 0, "Clear snapshots when polling stops");
 }
